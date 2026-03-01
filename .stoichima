@@ -1,0 +1,11 @@
+# Get your free key at https://www.football-data.org/
+FOOTBALL_DATA_API_KEY=your_key_here
+
+# App settings
+DATABASE_URL=sqlite:///./football.db
+ENVIRONMENT=development
+DEBUG=True
+
+# Leagues (do not change unless adding new leagues)
+PREMIER_LEAGUE_ID=PL
+LA_LIGA_ID=PD
