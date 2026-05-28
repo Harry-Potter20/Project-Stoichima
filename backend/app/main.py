@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.config import get_settings
 from api.routes.predictions import router as predictions_router
+from api.routes.accuracy import router as accuracy_router
 from fastapi.middleware.cors import CORSMiddleware
 
 settings = get_settings()
@@ -21,6 +22,7 @@ app.add_middleware(
 )
 
 app.include_router(predictions_router, prefix="/api/v1", tags=["predictions"])
+app.include_router(accuracy_router,    prefix="/api/v1", tags=["accuracy"])
 
 @app.get("/")
 def root():

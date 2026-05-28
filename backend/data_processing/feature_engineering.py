@@ -3,11 +3,43 @@ import numpy as np
 from collections import defaultdict
 from data_processing.team_normalizer import normalise_team_name
 
+
+def _add_xg_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+    df = df.sort_values("match_date").copy()
+    team_xg_history: dict = defaultdict(list)
+    home_xg_avg, away_xg_avg = [], []
+
+    for _, row in df.iterrows():
+        home_team = row["home_team"]
+        away_team = row["away_team"]
+
+        def _xg_avg(team, history):
+            recent = [m for m in history[-window:] if m["xg"] is not None and not np.isnan(m["xg"])]
+            return float(np.mean([m["xg"] for m in recent])) if recent else 0.0
+
+        home_xg_avg.append(_xg_avg(home_team, team_xg_history[home_team]))
+        away_xg_avg.append(_xg_avg(away_team, team_xg_history[away_team]))
+
+        home_xg = row.get("home_team_xG")
+        away_xg = row.get("away_team_xG")
+        team_xg_history[home_team].append({"xg": home_xg})
+        team_xg_history[away_team].append({"xg": away_xg})
+
+    df["home_xg_avg"] = home_xg_avg
+    df["away_xg_avg"] = away_xg_avg
+    return df
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_values("match_date").copy()
     df["home_team"] = df["home_team"].apply(normalise_team_name)
     df["away_team"] = df["away_team"].apply(normalise_team_name)
+    # Ensure xG columns exist (may be absent in CSV-sourced data)
+    if "home_team_xG" not in df.columns:
+        df["home_team_xG"] = np.nan
+    if "away_team_xG" not in df.columns:
+        df["away_team_xG"] = np.nan
     df = _add_form_and_goals_features(df)
+    df = _add_xg_features(df)
     df = _add_h2h_features(df)
 
     # Derived matchup features

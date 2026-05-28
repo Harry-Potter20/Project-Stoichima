@@ -51,7 +51,7 @@ def import_csv(file_path, competition_id, season):
 def save_df_to_db(df, competition_id, season):
     with SessionLocal() as session:
         for _, row in df.iterrows():
-            total, over_1_5, over_2_5 = _derive_match_statistics(row["home_team_score"], row["away_team_score"])
+            total, over_1_5, over_2_5, btts = _derive_match_statistics(row["home_team_score"], row["away_team_score"])
             match = Match(
                 id=_generate_match_id(row["home_team"], row["away_team"], row["match_date"]),
                 home_team=row["home_team"],
@@ -63,6 +63,7 @@ def save_df_to_db(df, competition_id, season):
                 total_goals=total,
                 over_1_5_goals=over_1_5,
                 over_2_5_goals=over_2_5,
+                btts=btts,
                 home_team_score=_clean(row["home_team_score"]),
                 away_team_score=_clean(row["away_team_score"]),
                 home_team_shots=_clean(row.get("home_team_shots")),
@@ -107,6 +108,6 @@ if __name__ == "__main__":
         print("Import complete.")
     else:
         import_all_seasons(
-            competitions=["PL", "PD"],
+            competitions=["PL", "PD", "BL1", "SA", "FL1"],
             seasons=[2019, 2020, 2021, 2022, 2023, 2024]
         )

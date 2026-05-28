@@ -14,15 +14,16 @@ def init_db():
     """Initialize the database."""
     Base.metadata.create_all(bind=engine)
     
-def _derive_match_statistics(home_score: Optional[int], away_score: Optional[int]) -> tuple[Optional[int], Optional[bool], Optional[bool]]:
+def _derive_match_statistics(home_score: Optional[int], away_score: Optional[int]) -> tuple[Optional[int], Optional[bool], Optional[bool], Optional[bool]]:
     """Derive additional match statistics from the raw match data."""
     if home_score is None or away_score is None:
-       return (None, None, None)
+       return (None, None, None, None)
     else:
         total = home_score + away_score
         return (total,
                 total > 1.5,
-                total > 2.5)
+                total > 2.5,
+                home_score > 0 and away_score > 0)
         
 
 
@@ -37,11 +38,11 @@ def collect_historical_data(competition_id: str):
             session.merge(team)
 
         for match_data in matches:
-            total, over_1_5, over_2_5 = _derive_match_statistics(
+            total, over_1_5, over_2_5, btts = _derive_match_statistics(
                 match_data["score"]["fullTime"]["home"],
                 match_data["score"]["fullTime"]["away"]
             )
-            
+
             match = Match(
                 id=match_data["id"],
                 match_date=datetime.fromisoformat(match_data["utcDate"].replace("Z", "+00:00")),
@@ -61,6 +62,7 @@ def collect_historical_data(competition_id: str):
                 total_goals=total,
                 over_1_5_goals=over_1_5,
                 over_2_5_goals=over_2_5,
+                btts=btts,
                 home_team_shots=match_data.get("homeTeamShots"),
                 away_team_shots=match_data.get("awayTeamShots"),
                 home_team_shots_on_target=match_data.get("homeTeamShotsOnTarget"),

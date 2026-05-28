@@ -19,7 +19,9 @@ FEATURES = [
     "home_goals_conceded_avg",
     "away_goals_scored_avg",
     "away_goals_conceded_avg",
-    "h2h_home_win_rate"
+    "h2h_home_win_rate",
+    "home_xg_avg",
+    "away_xg_avg",
 ]
 
 TARGET = "result"
@@ -48,15 +50,29 @@ class MatchOutcomeModel:
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         X_test = df[FEATURES]
         return self.model.predict(X_test)
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        X_test = df[FEATURES]
+        raw = self.model.predict_proba(X_test)
+        # Columns are in label-encoded order; reorder to H, D, A
+        classes = list(self.label_encoder.classes_)
+        idx = {c: i for i, c in enumerate(classes)}
+        order = [idx[c] for c in ["H", "D", "A"]]
+        return raw[:, order]
     
-    def evaluate(self, df: pd.DataFrame):
+    def evaluate(self, df: pd.DataFrame) -> dict:
         test_df = df[df["season"] >= CUTOFF_SEASON]
         X_test = test_df[FEATURES]
-        y_test = test_df[TARGET]
-        y_test = self.label_encoder.transform(y_test)
+        y_test = self.label_encoder.transform(test_df[TARGET])
         y_pred = self.model.predict(X_test)
+        report = classification_report(y_test, y_pred, output_dict=True)
         print(classification_report(y_test, y_pred))
-        print(confusion_matrix(y_test, y_pred))
+        return {
+            "accuracy":       report["accuracy"],
+            "macro_f1":       report["macro avg"]["f1-score"],
+            "weighted_f1":    report["weighted avg"]["f1-score"],
+            "test_samples":   len(y_test),
+        }
         
     def decode(self, predictions):
         return self.label_encoder.inverse_transform(predictions)

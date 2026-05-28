@@ -15,7 +15,9 @@ FEATURES = [
     "away_goals_scored_avg",
     "away_goals_conceded_avg",
     "home_attack_vs_away_defense",
-    "away_attack_vs_home_defense"
+    "away_attack_vs_home_defense",
+    "home_xg_avg",
+    "away_xg_avg",
 ]
 
 TARGET = "over_2_5_goals"
@@ -35,14 +37,24 @@ class GoalsModel:
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         X_test = df[FEATURES]
         return self.model.predict(X_test)
+
+    def predict_proba(self, df: pd.DataFrame) -> np.ndarray:
+        X_test = df[FEATURES]
+        return self.model.predict_proba(X_test)  # columns: [under, over]
     
-    def evaluate(self, df: pd.DataFrame):
+    def evaluate(self, df: pd.DataFrame) -> dict:
         test_df = df[df["season"] >= CUTOFF_SEASON]
         X_test = test_df[FEATURES]
         y_test = test_df[TARGET]
         y_pred = self.model.predict(X_test)
+        report = classification_report(y_test, y_pred, output_dict=True)
         print(classification_report(y_test, y_pred))
-        print(confusion_matrix(y_test, y_pred))
+        return {
+            "accuracy":     report["accuracy"],
+            "macro_f1":     report["macro avg"]["f1-score"],
+            "weighted_f1":  report["weighted avg"]["f1-score"],
+            "test_samples": len(y_test),
+        }
 
     def save(self, file_path: str):
         os.makedirs(os.path.dirname(file_path), exist_ok=True)

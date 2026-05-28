@@ -3,8 +3,11 @@ import io
 import pandas as pd
 
 DIVISION_MAP = {
-    "PL": "E0",
-    "PD": "SP1"
+    "PL":  "E0",
+    "PD":  "SP1",
+    "BL1": "D1",
+    "SA":  "I1",
+    "FL1": "F1",
 }
 
 def _build_csv_url(competition_id: str, season: int) -> str:

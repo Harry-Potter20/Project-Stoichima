@@ -1,18 +1,34 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .env
+.env.example
+
+# Databases & local stores
 *.db
 *.sqlite
+# MLflow file-based store (deprecated Feb 2026 — use sqlite:///mlflow.db)
+mlruns/
+
+# ML Artefacts
 *.pkl
 *.joblib
+# PyTorch model weights (BiLSTM — Phase 4)
+*.pt
+saved_models/
 data/raw/
 
 # Mac
 .DS_Store
 .idea/
-.vscode/
 *.log
+
+# VS Code — ignore personal/generated files, keep shared workspace config
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
 
 # Virtual Environment
 venv/
@@ -20,9 +36,10 @@ venv/
 stoichima/
 
 # Frontend React
-/frontend/node_modules
-/frontend/build
+/frontend/node_modules/
+/frontend/build/
 /frontend/.env
 
-# ML Models
-saved_models/
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
