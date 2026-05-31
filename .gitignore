@@ -3,26 +3,47 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .env
-.env.example
 
 # Databases & local stores
 *.db
+*.db-shm
+*.db-wal
 *.sqlite
-# MLflow file-based store (deprecated Feb 2026 — use sqlite:///mlflow.db)
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sql
+# MLflow file-based store
 mlruns/
+mlartifacts/
 
-# ML Artefacts
+# Optuna hyperparameter search DB (written by train_models.py)
+optuna.db
+optuna_journal.log
+
+# ML artefacts — trained weights, encoders, feature lists
 *.pkl
 *.joblib
-# PyTorch model weights (BiLSTM — Phase 4)
 *.pt
+*.pt.tmp
 saved_models/
 data/raw/
+
+# Understat / API-Football raw data dumps
+backend/data_collection/raw/
+backend/data/*.json
+backend/data/*.csv
+backend/data/*.parquet
+
+# Logs (backend server, scheduler, training runs)
+*.log
+nohup.out
+/tmp/*.log
+backend/logs/
 
 # Mac
 .DS_Store
 .idea/
-*.log
 
 # VS Code — ignore personal/generated files, keep shared workspace config
 .vscode/*
@@ -39,7 +60,20 @@ stoichima/
 /frontend/node_modules/
 /frontend/build/
 /frontend/.env
+/frontend/.env.local
+/frontend/.env.production
 
 # Jupyter
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
+
+# APScheduler job store (if persisted to disk)
+apscheduler.db
+
+# Telegram / secrets (belt-and-suspenders on top of .env)
+secrets.json
+credentials.json
+api_keys.json
+
+# OS
+Thumbs.db

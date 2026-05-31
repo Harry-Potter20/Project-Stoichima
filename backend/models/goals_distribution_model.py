@@ -161,11 +161,14 @@ class GoalsDistributionModel:
     # Score matrix
     # ------------------------------------------------------------------
 
-    def predict_score_matrix(self, home_team: str, away_team: str) -> np.ndarray:
+    def predict_score_matrix(
+        self, home_team: str, away_team: str, neutral_venue: bool = False
+    ) -> np.ndarray:
         """
         Returns a (MAX_GOALS+1, MAX_GOALS+1) matrix where entry [i, j] is
         P(home scores i, away scores j). Falls back to league-average
         parameters for unknown teams.
+        When neutral_venue=True, home_advantage is zeroed out.
         """
         avg_attack  = float(np.mean(list(self.attack.values())))  if self.attack  else 0.0
         avg_defense = float(np.mean(list(self.defense.values()))) if self.defense else 0.0
@@ -175,7 +178,8 @@ class GoalsDistributionModel:
         a_a = self.attack.get(away_team,  avg_attack)
         d_a = self.defense.get(away_team, avg_defense)
 
-        lambda_h = np.exp(a_h + d_a + self.home_advantage)
+        home_adv = 0.0 if neutral_venue else self.home_advantage
+        lambda_h = np.exp(a_h + d_a + home_adv)
         lambda_a = np.exp(a_a + d_h)
 
         matrix = np.zeros((MAX_GOALS + 1, MAX_GOALS + 1))
@@ -188,6 +192,19 @@ class GoalsDistributionModel:
                 )
         matrix /= matrix.sum()  # renormalise after DC correction
         return matrix
+
+    def get_lambdas(
+        self, home_team: str, away_team: str, neutral_venue: bool = False
+    ) -> tuple[float, float]:
+        """Returns (lambda_home, lambda_away) — the Poisson rate parameters (= expected goals)."""
+        avg_attack  = float(np.mean(list(self.attack.values())))  if self.attack  else 0.0
+        avg_defense = float(np.mean(list(self.defense.values()))) if self.defense else 0.0
+        a_h = self.attack.get(home_team,  avg_attack)
+        d_h = self.defense.get(home_team, avg_defense)
+        a_a = self.attack.get(away_team,  avg_attack)
+        d_a = self.defense.get(away_team, avg_defense)
+        home_adv = 0.0 if neutral_venue else self.home_advantage
+        return float(np.exp(a_h + d_a + home_adv)), float(np.exp(a_a + d_h))
 
     # ------------------------------------------------------------------
     # Market derivations
@@ -245,6 +262,38 @@ class GoalsDistributionModel:
         away_win = 1.0 - home_win
         return {"home": round(home_win, 6), "away": round(away_win, 6)}
 
+    def market_dnb(self, matrix: np.ndarray) -> dict:
+        """
+        Draw No Bet: stake returned on a draw.
+        Effective win probability is conditioned on a result (non-draw).
+        """
+        m = self.market_1x2(matrix)
+        non_draw = m["H"] + m["A"]
+        if non_draw < 1e-9:
+            return {"home": 0.5, "away": 0.5}
+        return {
+            "home": round(m["H"] / non_draw, 6),
+            "away": round(m["A"] / non_draw, 6),
+        }
+
+    def market_wbtts(self, matrix: np.ndarray) -> dict:
+        """
+        Win & Both Teams To Score.
+        home: P(home wins AND both score)
+        away: P(away wins AND both score)
+        """
+        home_win_btts = float(np.sum(matrix[1:, 1:][
+            np.tril(np.ones((MAX_GOALS, MAX_GOALS), dtype=bool), -1)
+        ]))
+        away_win_btts = float(np.sum(matrix[1:, 1:][
+            np.triu(np.ones((MAX_GOALS, MAX_GOALS), dtype=bool), 1)
+        ]))
+        return {
+            "home": round(home_win_btts, 6),
+            "away": round(away_win_btts, 6),
+            "either": round(home_win_btts + away_win_btts, 6),
+        }
+
     def market_correct_score(self, matrix: np.ndarray, top_n: int = 10) -> list[dict]:
         scores = []
         for i in range(MAX_GOALS + 1):
@@ -256,12 +305,14 @@ class GoalsDistributionModel:
                 })
         return sorted(scores, key=lambda x: x["probability"], reverse=True)[:top_n]
 
-    def all_markets(self, home_team: str, away_team: str) -> dict:
+    def all_markets(self, home_team: str, away_team: str, neutral_venue: bool = False) -> dict:
         """Convenience: compute everything in one call."""
-        matrix = self.predict_score_matrix(home_team, away_team)
+        matrix = self.predict_score_matrix(home_team, away_team, neutral_venue=neutral_venue)
         return {
             "1x2":            self.market_1x2(matrix),
             "btts":           self.market_btts(matrix),
+            "dnb":            self.market_dnb(matrix),
+            "wbtts":          self.market_wbtts(matrix),
             "double_chance":  self.market_double_chance(matrix),
             "over_under": {
                 "1.5": self.market_over_under(matrix, 1.5),

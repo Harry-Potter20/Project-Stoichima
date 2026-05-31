@@ -24,8 +24,37 @@ CSV_COLUMN_NAMES = {
     "HR": "home_team_red_cards",
     "AR": "away_team_red_cards",
     "HF": "home_team_fouls",
-    "AF": "away_team_fouls"
-}   
+    "AF": "away_team_fouls",
+    "Referee": "referee",
+    # Opening odds (IW = Interwetten, often earliest available; VC = VC Bet fallback)
+    "IWH": "opening_home_odds",
+    "IWD": "opening_draw_odds",
+    "IWA": "opening_away_odds",
+    # VC columns mapped to separate names so we can coalesce without duplicate columns
+    "VCH": "vc_home_odds",
+    "VCD": "vc_draw_odds",
+    "VCA": "vc_away_odds",
+    # Bookmaker odds columns
+    "B365H": "b365_home",
+    "B365D": "b365_draw",
+    "B365A": "b365_away",
+    "PSH":   "ps_home",
+    "PSD":   "ps_draw",
+    "PSA":   "ps_away",
+    "MaxH":  "max_home",
+    "MaxD":  "max_draw",
+    "MaxA":  "max_away",
+    "AvgH":  "avg_home",
+    "AvgD":  "avg_draw",
+    "AvgA":  "avg_away",
+    # Some older seasons use BbMxH instead of MaxH
+    "BbMxH": "max_home",
+    "BbMxD": "max_draw",
+    "BbMxA": "max_away",
+    "BbAvH": "avg_home",
+    "BbAvD": "avg_draw",
+    "BbAvA": "avg_away",
+}
 
 
 def _clean(value):
@@ -78,7 +107,24 @@ def save_df_to_db(df, competition_id, season):
                 away_team_red_cards=_clean(row.get("away_team_red_cards")),
                 home_team_fouls=_clean(row.get("home_team_fouls")),
                 away_team_fouls=_clean(row.get("away_team_fouls")),
-                result=_clean(row["result"])
+                result=_clean(row["result"]),
+                b365_home=_clean(row.get("b365_home")),
+                b365_draw=_clean(row.get("b365_draw")),
+                b365_away=_clean(row.get("b365_away")),
+                ps_home=_clean(row.get("ps_home")),
+                ps_draw=_clean(row.get("ps_draw")),
+                ps_away=_clean(row.get("ps_away")),
+                max_home=_clean(row.get("max_home")),
+                max_draw=_clean(row.get("max_draw")),
+                max_away=_clean(row.get("max_away")),
+                avg_home=_clean(row.get("avg_home")),
+                avg_draw=_clean(row.get("avg_draw")),
+                avg_away=_clean(row.get("avg_away")),
+                referee=_clean(row.get("referee")),
+                # Coalesce IW (preferred) → VC fallback for opening odds
+                opening_home_odds=_clean(row.get("opening_home_odds") or row.get("vc_home_odds")),
+                opening_draw_odds=_clean(row.get("opening_draw_odds") or row.get("vc_draw_odds")),
+                opening_away_odds=_clean(row.get("opening_away_odds") or row.get("vc_away_odds")),
             )
             session.merge(match)
         session.commit()
@@ -108,6 +154,15 @@ if __name__ == "__main__":
         print("Import complete.")
     else:
         import_all_seasons(
-            competitions=["PL", "PD", "BL1", "SA", "FL1"],
+            competitions=[
+                # Big 5 top-flight
+                "PL", "PD", "BL1", "SA", "FL1",
+                # Big 5 second tier
+                "ELC", "BL2", "PD2", "SB", "FL2", "SPL",
+                # EFL lower tiers
+                "EL1", "EL2",
+                # Other European top-flights
+                "ERE", "JPL", "PPL", "TSL", "GSL",
+            ],
             seasons=[2019, 2020, 2021, 2022, 2023, 2024]
         )

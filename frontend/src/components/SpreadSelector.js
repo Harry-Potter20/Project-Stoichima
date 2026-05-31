@@ -7,6 +7,7 @@ const MARKETS = [
   { key: 'correct_score',   label: 'Correct Score' },
   { key: 'double_chance',   label: 'Double Chance' },
   { key: 'btts',            label: 'BTTS' },
+  { key: 'odds_edge',       label: 'Odds / Edge' },
 ];
 
 const GOAL_LINES   = ['1.5', '2.5', '3.5', '4.5'];

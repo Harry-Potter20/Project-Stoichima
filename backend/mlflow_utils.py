@@ -43,8 +43,30 @@ def model_run(run_name: str, tags: dict | None = None):
             mlflow.log_artifact("saved_models/match_outcome.pkl")
     """
     setup_tracking()
+    # MLflow 3.x awaits stale RUNNING runs with the same name before opening a
+    # new one — this deadlocks after a killed training process. Terminate them.
+    _terminate_stale_runs(run_name)
+    if hasattr(mlflow, "flush_async_logging"):
+        mlflow.flush_async_logging()
     with mlflow.start_run(run_name=run_name, tags=tags or {}) as run:
         yield run
+
+
+def _terminate_stale_runs(run_name: str) -> None:
+    """Mark any RUNNING runs with the given name as KILLED so they don't block."""
+    try:
+        exp = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
+        if exp is None:
+            return
+        client = mlflow.tracking.MlflowClient()
+        stale = client.search_runs(
+            exp.experiment_id,
+            filter_string=f"attributes.status = 'RUNNING' and tags.mlflow.runName = '{run_name}'",
+        )
+        for r in stale:
+            client.set_terminated(r.info.run_id, status="KILLED")
+    except Exception:
+        pass
 
 
 def log_dataset_info(df, label: str = "training"):

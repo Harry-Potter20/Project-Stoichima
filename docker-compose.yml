@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  backend:
+    build: ./backend
+    container_name: stoichima_backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    volumes:
+      # Persist the SQLite database (or swap DATABASE_URL for Postgres below)
+      - ./backend/football.db:/app/football.db
+      - ./backend/saved_models:/app/saved_models
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build: ./frontend
+    container_name: stoichima_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+  # ── Optional: PostgreSQL instead of SQLite ───────────────────────────────
+  # To use Postgres, uncomment this block and set in backend/.env:
+  #   DATABASE_URL=postgresql://stoichima:secret@db:5432/stoichima
+  #
+  # db:
+  #   image: postgres:16-alpine
+  #   container_name: stoichima_db
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: stoichima
+  #     POSTGRES_PASSWORD: secret
+  #     POSTGRES_DB: stoichima
+  #   volumes:
+  #     - pg_data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+
+volumes:
+  pg_data:
