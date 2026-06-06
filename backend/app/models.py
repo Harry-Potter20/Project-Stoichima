@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, ForeignKey, JSON, Index
 from sqlalchemy.sql import func
 from app.database import Base
 
@@ -299,6 +299,8 @@ class BetLog(Base):
     closing_home_odds = Column(Float, nullable=True)
     closing_draw_odds = Column(Float, nullable=True)
     closing_away_odds = Column(Float, nullable=True)
+    # CLV = (entry_odds / closing_odds - 1) * 100 — stored at settlement
+    clv_pct           = Column(Float, nullable=True)
 
     created_at       = Column(DateTime, server_default=func.now())
     sport            = Column(String, nullable=False, default="football", server_default="football")
@@ -469,3 +471,115 @@ class TennisPlayerElo(Base):
 
     def __repr__(self):
         return f"<TennisPlayerElo {self.player_name} overall={self.elo_overall:.0f}>"
+# ─── Live match tracking ─────────────────────────────────────────────────────
+
+class LiveMatchState(Base):
+    """
+    Current snapshot of an in-play match. One row per match; updated in-place by
+    the live ingest job. Pre-match xG/lambdas are frozen at kickoff so the live
+    Poisson predictor can apply time-decay without re-running the pre-match
+    ensemble on every poll.
+    """
+    __tablename__ = "live_match_state"
+
+    match_id       = Column(Integer, ForeignKey("matches.id"), primary_key=True)
+    competition    = Column(String, nullable=False, index=True)
+    home_team      = Column(String, nullable=False)
+    away_team      = Column(String, nullable=False)
+    kickoff_at     = Column(DateTime, nullable=False)
+    status         = Column(String, default="NOT_STARTED", index=True)
+        # NOT_STARTED, IN_PLAY, HT, IN_PLAY_2H, FT, AET, PEN, SUSPENDED
+    minute         = Column(Integer, default=0)
+    home_score     = Column(Integer, default=0)
+    away_score     = Column(Integer, default=0)
+    home_xg_live   = Column(Float, default=0.0)   # cumulative in-play xG
+    away_xg_live   = Column(Float, default=0.0)
+    home_red_cards = Column(Integer, default=0)
+    away_red_cards = Column(Integer, default=0)
+    home_yellow_cards = Column(Integer, default=0)
+    away_yellow_cards = Column(Integer, default=0)
+    # Pre-match anchors — frozen at kickoff, used by live Poisson update
+    prematch_lambda_home = Column(Float, nullable=True)
+    prematch_lambda_away = Column(Float, nullable=True)
+    last_event_at  = Column(DateTime, nullable=True)
+    last_polled_at = Column(DateTime, default=func.now())
+
+
+class LiveMatchEvent(Base):
+    """
+    Append-only log of in-play events (goals, cards, subs, VAR reviews).
+    Used by the timeline UI + Telegram alerts.
+    """
+    __tablename__ = "live_match_events"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    match_id    = Column(Integer, ForeignKey("matches.id"), nullable=False, index=True)
+    minute      = Column(Integer, nullable=False)
+    type        = Column(String, nullable=False)
+        # goal, own_goal, penalty_goal, penalty_missed, yellow, red, sub,
+        # var_check, half_start, half_end
+    team        = Column(String, nullable=True)
+    player      = Column(String, nullable=True)
+    detail      = Column(JSON, nullable=True)
+    api_event_id = Column(String, nullable=True, index=True)  # for dedup
+    created_at  = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        Index("ix_live_events_match_min", "match_id", "minute"),
+    )
+
+
+class LivePredictionSnapshot(Base):
+    """
+    One row per minute per match — captures the live model output trajectory.
+    Used by the probability sparkline on the live tab and by the CLV alerter
+    (compares model probs vs live market odds).
+    """
+    __tablename__ = "live_prediction_snapshots"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    match_id        = Column(Integer, ForeignKey("matches.id"), nullable=False, index=True)
+    minute          = Column(Integer, nullable=False)
+    home_win_prob   = Column(Float, nullable=False)
+    draw_prob       = Column(Float, nullable=False)
+    away_win_prob   = Column(Float, nullable=False)
+    over_2_5_prob   = Column(Float, nullable=True)
+    btts_prob       = Column(Float, nullable=True)
+    expected_total_goals = Column(Float, nullable=True)
+    # Live market odds at this minute (for CLV / edge tracking)
+    book_home_odds  = Column(Float, nullable=True)
+    book_draw_odds  = Column(Float, nullable=True)
+    book_away_odds  = Column(Float, nullable=True)
+    bookmaker       = Column(String, nullable=True)
+    snapshot_at     = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        Index("ix_live_snap_match_min", "match_id", "minute"),
+    )
+
+
+
+class NationalTeamSquad(Base):
+    """
+    Maps national team players to their nation. Lets player_props_model
+    resolve a national team to a list of players whose CLUB-level
+    PlayerMatchStats can then be aggregated for scoring rates.
+
+    Updated by data_collection/squad_fetcher.py (API-Football /players/squads)
+    or by manual seeding (data_collection/squad_seed.py).
+    """
+    __tablename__ = "national_team_squads"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    nation       = Column(String, nullable=False, index=True)
+    player_name  = Column(String, nullable=False, index=True)
+    club_team    = Column(String, nullable=True)
+    position     = Column(String, nullable=True)
+    shirt_number = Column(Integer, nullable=True)
+    is_captain   = Column(Boolean, default=False)
+    source       = Column(String, default="api_football")
+    confirmed_at = Column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_squad_nation_player", "nation", "player_name", unique=True),
+    )

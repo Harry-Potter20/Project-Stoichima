@@ -280,25 +280,32 @@ def _add_fixture_congestion(df: pd.DataFrame) -> pd.DataFrame:
     """
     Matches each team played in the 7 days prior to each fixture.
     High congestion → rotation risk, fatigue, reduced quality.
+
+    Vectorised: for each team build a DatetimeIndex of all their match dates,
+    then use searchsorted to count matches in the rolling 7-day window — O(n log n)
+    instead of the previous O(n²) nested loop.
     """
     df = df.sort_values("match_date").copy()
-    home_c, away_c = [], []
-    home_teams = df["home_team"].values
-    away_teams = df["away_team"].values
-    dates = pd.to_datetime(df["match_date"].values)
+    dates = pd.to_datetime(df["match_date"])
 
-    for i in range(len(df)):
-        window_start = dates[i] - pd.Timedelta(days=7)
-        ht, at = home_teams[i], away_teams[i]
-        h_count, a_count = 0, 0
-        for j in range(i):  # only prior matches (df is sorted)
-            if dates[j] >= window_start:
-                if home_teams[j] == ht or away_teams[j] == ht:
-                    h_count += 1
-                if home_teams[j] == at or away_teams[j] == at:
-                    a_count += 1
-        home_c.append(h_count)
-        away_c.append(a_count)
+    # Build a sorted list of match dates per team (both home and away appearances).
+    from collections import defaultdict
+    team_dates: dict[str, list] = defaultdict(list)
+    for d, ht, at in zip(dates, df["home_team"], df["away_team"]):
+        team_dates[ht].append(d)
+        team_dates[at].append(d)
+    team_date_arrays = {t: np.array(sorted(ds), dtype="datetime64[ns]") for t, ds in team_dates.items()}
+
+    window = np.timedelta64(7, "D")
+    home_c, away_c = [], []
+    for d, ht, at in zip(dates.values, df["home_team"].values, df["away_team"].values):
+        d64 = np.datetime64(d, "ns")
+        for team, out in ((ht, home_c), (at, away_c)):
+            arr = team_date_arrays.get(team, np.array([], dtype="datetime64[ns]"))
+            # Count dates in (d - 7d, d) — exclude d itself (prior matches only)
+            lo = np.searchsorted(arr, d64 - window, side="left")
+            hi = np.searchsorted(arr, d64, side="left")  # exclusive of current match
+            out.append(int(hi - lo))
 
     df["home_matches_last_7d"] = home_c
     df["away_matches_last_7d"] = away_c
@@ -530,8 +537,12 @@ def _apply_promotion_shrinkage(df: pd.DataFrame, shrink: float = 0.4) -> pd.Data
         return df
 
     df = df.copy()
-    league_avg_scored    = df["home_goals_scored_avg"].median()
-    league_avg_conceded  = df["home_goals_conceded_avg"].median()
+    # Compute league average from FINISHED matches only; upcoming rows have 0.0-imputed
+    # rolling averages that would drag the median toward zero.
+    finished_mask = df["status"] == "FINISHED"
+    ref = df[finished_mask] if finished_mask.any() else df
+    league_avg_scored   = ref["home_goals_scored_avg"].median()
+    league_avg_conceded = ref["home_goals_conceded_avg"].median()
 
     for side in ("home", "away"):
         mask = df[f"{side}_newly_promoted"] == 1.0

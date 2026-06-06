@@ -7,6 +7,12 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.calibration import CalibratedClassifierCV
+try:
+    from sklearn.frozen import FrozenEstimator      # sklearn >= 1.6
+    _HAS_FROZEN = True
+except ImportError:                                  # pragma: no cover
+    FrozenEstimator = None
+    _HAS_FROZEN = False
 from sklearn.model_selection import TimeSeriesSplit
 from xgboost import XGBClassifier
 from sklearn.metrics import classification_report, f1_score, accuracy_score
@@ -119,6 +125,7 @@ class MatchOutcomeModel:
     def __init__(self):
         self.model = None   # replaced by CalibratedClassifierCV in train()
         self.label_encoder = LabelEncoder()
+        self._explainer = None  # cached shap.TreeExplainer — built once on first explain() call
 
     def train(
         self,
@@ -147,9 +154,17 @@ class MatchOutcomeModel:
         available = [f for f in feat_list if f in valid.columns]
         X_train = valid[available].fillna(0.0)
         y_train = self.label_encoder.fit_transform(valid[TARGET])
+        sw_aligned = sw_series.values  # numpy array aligned to valid rows
 
+        # SMOTE oversamples the minority class; weights cannot be carried through
+        # directly, so we apply them pre-SMOTE on the XGBClassifier via sample_weight
+        # on the base estimator rather than on the calibrated wrapper.
         smote = SMOTE(random_state=42)
         X_resampled, y_resampled = smote.fit_resample(X_train, y_train)
+        # Synthetic SMOTE rows get weight 1.0; original rows keep their weight.
+        n_orig = len(X_train)
+        n_synth = len(X_resampled) - n_orig
+        sw_resampled = np.concatenate([sw_aligned, np.ones(n_synth)])
 
         base_params = dict(
             n_estimators=300,
@@ -163,12 +178,17 @@ class MatchOutcomeModel:
         if xgb_params:
             base_params.update(xgb_params)
 
-        self.model = CalibratedClassifierCV(
-            XGBClassifier(**base_params),
-            method="isotonic",
-            cv=5,
-        )
-        self.model.fit(X_resampled, y_resampled)
+        xgb_base = XGBClassifier(**base_params)
+        xgb_base.fit(X_resampled, y_resampled, sample_weight=sw_resampled)
+
+        # Wrap in calibration using pre-fit estimator.
+        # sklearn >= 1.6: use FrozenEstimator (cv="prefit" was deprecated).
+        # sklearn <  1.6: fall back to cv="prefit".
+        if _HAS_FROZEN:
+            self.model = CalibratedClassifierCV(FrozenEstimator(xgb_base), method="isotonic")
+        else:
+            self.model = CalibratedClassifierCV(xgb_base, method="isotonic", cv="prefit")
+        self.model.fit(X_train.values, y_train, sample_weight=sw_aligned)
         self._trained_features = available
 
     def _feature_matrix(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -221,10 +241,13 @@ class MatchOutcomeModel:
             # Map H/D/A prediction indices back to XGBoost class indices
             hda_to_xgb = {0: 2, 1: 1, 2: 0}
 
-            # Use first base estimator from CalibratedClassifierCV
-            base = self.model.calibrated_classifiers_[0].estimator
-            explainer = shap.TreeExplainer(base)
-            raw_sv = explainer.shap_values(X_np)
+            # Use first base estimator from CalibratedClassifierCV.
+            # Cache the explainer on the model instance — building it is O(n_trees)
+            # and takes 200-800ms; we don't want to pay that cost per request.
+            if self._explainer is None:
+                base = self.model.calibrated_classifiers_[0].estimator
+                self._explainer = shap.TreeExplainer(base)
+            raw_sv = self._explainer.shap_values(X_np)
 
             # Normalise to (n_samples, n_features, n_classes)
             if isinstance(raw_sv, list):
@@ -400,6 +423,39 @@ class MatchOutcomeModel:
             print(f"  Pruning {len(dropped)} low-gain features: {dropped[:8]}{'…' if len(dropped)>8 else ''}")
         return kept
 
+    def compute_conformal_q90(self, df: pd.DataFrame) -> float:
+        """
+        Split-conformal calibration: compute the 90th-percentile absolute residual
+        on a held-out calibration set so the predictor can report coverage-guaranteed
+        intervals without assuming Gaussian errors.
+
+        Call after train() on a held-out calibration split (not the training data).
+        Stores result as self._conformal_q90 and returns it.
+
+        Residual = |predicted_max_prob - 1.0| for correctly predicted rows,
+                   |predicted_max_prob - 0.0| for incorrectly predicted rows.
+        This is the standard conformal score for multiclass classification.
+        """
+        valid = df.dropna(subset=[TARGET]).copy()
+        if len(valid) < 20:
+            return 0.15  # not enough data — conservative fallback
+        proba = self.predict_proba(valid)
+        y_true = self.label_encoder.transform(valid[TARGET])
+        # Conformal score: 1 - P(true class)
+        hda_to_enc = {0: list(self.label_encoder.classes_).index("H"),
+                      1: list(self.label_encoder.classes_).index("D"),
+                      2: list(self.label_encoder.classes_).index("A")}
+        scores = []
+        for i, enc_label in enumerate(y_true):
+            hda_idx = [k for k, v in hda_to_enc.items() if v == enc_label]
+            if hda_idx:
+                scores.append(1.0 - float(proba[i][hda_idx[0]]))
+        if not scores:
+            return 0.15
+        q90 = float(np.quantile(scores, 0.90))
+        self._conformal_q90 = round(q90, 4)
+        return self._conformal_q90
+
     def save(self, file_path: str):
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         joblib.dump(self.model, file_path)
@@ -409,16 +465,27 @@ class MatchOutcomeModel:
             getattr(self, "_trained_features", FEATURES),
             file_path.replace(".pkl", "_features.pkl"),
         )
+        # Persist conformal quantile if computed
+        if hasattr(self, "_conformal_q90"):
+            joblib.dump(self._conformal_q90, file_path.replace(".pkl", "_conformal_q90.pkl"))
 
     def load(self, file_path: str):
         self.model = joblib.load(file_path)
-        self.label_encoder = joblib.load(file_path.replace(".pkl", "_label_encoder.pkl"))
+        enc_path = file_path.replace(".pkl", "_label_encoder.pkl")
+        if os.path.exists(enc_path):
+            self.label_encoder = joblib.load(enc_path)
+        # else: label_encoder stays as the default LabelEncoder() from __init__;
+        # caller must re-fit or the model is effectively unusable for decoding,
+        # but at least startup doesn't crash on a stale/partial artifact.
         feat_path = file_path.replace(".pkl", "_features.pkl")
         if os.path.exists(feat_path):
             self._trained_features = joblib.load(feat_path)
+        conf_path = file_path.replace(".pkl", "_conformal_q90.pkl")
+        if os.path.exists(conf_path):
+            self._conformal_q90 = joblib.load(conf_path)
         else:
-            # Derive feature list from the fitted XGBoost estimator itself so we
-            # never pass columns the model wasn't trained on (avoids "unseen at fit" errors).
+            # Derive feature list from the fitted base estimator when the sidecar
+            # file is absent (e.g. model saved before _features.pkl was introduced).
             try:
                 base = self.model.calibrated_classifiers_[0].estimator
                 if hasattr(base, "feature_names_in_"):

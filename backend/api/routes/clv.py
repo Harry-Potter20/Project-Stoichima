@@ -12,9 +12,9 @@ genuine predictive alpha.
 """
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, distinct
 from app.database import get_db
-from app.models import Prediction, Match
+from app.models import Prediction, Match, BetLog
 import numpy as np
 
 router = APIRouter()
@@ -117,3 +117,46 @@ def get_clv(competition_id: str, db: Session = Depends(get_db)):
         "running": running,
         "records": clv_records[-50:],   # last 50 for table display
     }
+
+
+@router.get("/clv")
+def get_clv_summary(db: Session = Depends(get_db)):
+    """
+    Cross-competition CLV grade summary sourced from BetLog rows with stored clv_pct.
+
+    For each competition with at least one settled bet that has closing odds:
+      - avg_clv_pct: mean CLV across all bets
+      - beat_close_pct: % of bets where we got better odds than closing
+      - n_bets: sample size
+      - win_rate: actual win rate on settled bets
+
+    This auto-grades the model without requiring result actuals — CLV is the
+    leading indicator; results are the lagging one.
+    """
+    competitions = [
+        row[0] for row in db.query(distinct(BetLog.competition))
+        .filter(BetLog.clv_pct.isnot(None))
+        .all()
+    ]
+
+    rows = []
+    for comp in competitions:
+        bets = db.query(BetLog).filter(
+            BetLog.competition == comp,
+            BetLog.clv_pct.isnot(None),
+        ).all()
+        if not bets:
+            continue
+        clvs = [b.clv_pct for b in bets]
+        settled = [b for b in bets if b.won is not None]
+        rows.append({
+            "competition":    comp,
+            "n_bets":         len(bets),
+            "avg_clv_pct":    round(float(np.mean(clvs)), 2),
+            "beat_close_pct": round(sum(1 for c in clvs if c > 0) / len(clvs) * 100, 1),
+            "win_rate":       round(sum(1 for b in settled if b.won) / len(settled) * 100, 1) if settled else None,
+            "n_settled":      len(settled),
+        })
+
+    rows.sort(key=lambda r: r["avg_clv_pct"], reverse=True)
+    return {"grades": rows}

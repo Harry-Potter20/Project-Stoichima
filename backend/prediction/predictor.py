@@ -24,6 +24,98 @@ from models.goals_distribution_model import GoalsDistributionModel
 from models.bilstm_model import BiLSTMModel
 from models.player_form_model import PlayerFormModel
 from models.ensemble_model import EnsembleModel
+from models.xg_model import XGModel
+
+
+def _rotation_penalty_for_match(db, home: str, away: str, match_date) -> float:
+    """
+    If we have a ConfirmedLineup for either side, compare the starting XI's
+    summed xG-per-90 against the team's recent squad-wide xG average. A big
+    drop signals heavy rotation (common in friendlies); we return an extra
+    shrinkage weight to apply.
+
+    Returns 0.0 when no lineup data is available or the rotation isn't material.
+    """
+    if db is None or not home or not away:
+        return 0.0
+    try:
+        from app.models import ConfirmedLineup, PlayerMatchStats
+        from sqlalchemy import func
+        from datetime import datetime, timedelta
+
+        # Only treat lineups confirmed within ±48h of kickoff as authoritative
+        if match_date is None:
+            return 0.0
+        if not isinstance(match_date, datetime):
+            try:
+                match_date = pd.to_datetime(match_date).to_pydatetime()
+            except Exception:
+                return 0.0
+        window_lo = match_date - timedelta(hours=48)
+        window_hi = match_date + timedelta(hours=4)
+
+        worst_drop = 0.0
+        for team in (home, away):
+            lineup = (
+                db.query(ConfirmedLineup)
+                .filter(
+                    ConfirmedLineup.team == team,
+                    ConfirmedLineup.confirmed_at >= window_lo,
+                    ConfirmedLineup.confirmed_at <= window_hi,
+                )
+                .order_by(ConfirmedLineup.confirmed_at.desc())
+                .first()
+            )
+            if not lineup or not lineup.starters:
+                continue
+
+            starters = [s.strip() for s in lineup.starters.split(",") if s.strip()][:11]
+            if not starters:
+                continue
+
+            # Sum starter per-90 xG over the last year
+            cutoff = datetime.utcnow() - timedelta(days=730)
+            rows = (
+                db.query(
+                    PlayerMatchStats.player_name,
+                    func.sum(PlayerMatchStats.xg).label("xg"),
+                    func.sum(PlayerMatchStats.minutes).label("min"),
+                )
+                .filter(
+                    PlayerMatchStats.player_name.in_(starters),
+                    PlayerMatchStats.match_date >= cutoff,
+                    PlayerMatchStats.minutes.isnot(None),
+                )
+                .group_by(PlayerMatchStats.player_name)
+                .all()
+            )
+            starter_xg_per_90 = 0.0
+            for r in rows:
+                if r.min and r.min > 0:
+                    starter_xg_per_90 += (r.xg or 0.0) / r.min * 90.0
+
+            # Compare to team's average xG-per-match (sum of starter equivalents)
+            team_match_xg = (
+                db.query(func.avg(PlayerMatchStats.xg) * 11)
+                .filter(
+                    PlayerMatchStats.team == team,
+                    PlayerMatchStats.match_date >= cutoff,
+                )
+                .scalar()
+            )
+            if not team_match_xg or team_match_xg <= 0:
+                continue
+
+            drop = 1.0 - (starter_xg_per_90 / float(team_match_xg))
+            if drop > worst_drop:
+                worst_drop = drop
+
+        # Translate drop → shrinkage. 30% drop ≈ +0.10 shrink, 60% ≈ +0.25.
+        if worst_drop < 0.20:
+            return 0.0
+        return min(0.30, (worst_drop - 0.20) * 0.7)
+    except Exception:
+        return 0.0
 
 MODEL_DIR = "saved_models"
 
@@ -37,6 +129,7 @@ class Predictor:
         self.bilstm_model:       BiLSTMModel | None           = None
         self.player_form_model:  PlayerFormModel | None       = None
         self.ensemble:           EnsembleModel | None         = None
+        self.xg_model:           XGModel | None               = None
         self._loaded = False
 
     def load(self) -> None:
@@ -75,6 +168,12 @@ class Predictor:
         else:
             self.dist_model = None
 
+        # International-only DC model — used for WC/EC/UNL/etc. since the
+        # club-trained model has parameters drowned out by 50k+ club matches.
+        self.dist_model_intl = None
+        if os.path.exists(_path("goals_distribution_intl.pkl")):
+            self.dist_model_intl = GoalsDistributionModel.load(_path("goals_distribution_intl.pkl"))
+
         if os.path.exists(_path("bilstm_model.pt")):
             self.bilstm_model = BiLSTMModel()
             self.bilstm_model.load(_path("bilstm_model.pt"))
@@ -82,6 +181,13 @@ class Predictor:
         if os.path.exists(_path("player_form_model.pkl")):
             self.player_form_model = PlayerFormModel()
             self.player_form_model.load(_path("player_form_model.pkl"))
+
+        if os.path.exists(_path("xg_model.pkl")):
+            try:
+                self.xg_model = XGModel()
+                self.xg_model.load(_path("xg_model.pkl"))
+            except Exception:
+                self.xg_model = None
 
         # Ensemble weights — load if saved, otherwise use defaults
         self.ensemble = EnsembleModel(
@@ -117,7 +223,35 @@ class Predictor:
         upcoming_df = self._inject_snapshot_odds(upcoming_df, competition, db)
 
         combined = pd.concat([finished_df, upcoming_df], ignore_index=True)
-        feature_df = build_features(combined, dist_model=self.dist_model, db=db)
+
+        # Load shots DataFrame from DB when xg_model is available so that
+        # model-derived xG features match the training pipeline exactly.
+        shots_df = None
+        if self.xg_model is not None and db is not None:
+            try:
+                from app.models import Shot
+                shot_rows = db.query(Shot).all()
+                if shot_rows:
+                    shots_df = pd.DataFrame([{
+                        "x": s.x, "y": s.y, "result": s.result,
+                        "shot_type": s.shot_type, "situation": s.situation,
+                        "last_action": s.last_action,
+                        "home_team": s.home_team, "away_team": s.away_team,
+                        "player_team": s.player_team,
+                        "season": s.season,
+                    } for s in shot_rows])
+            except Exception as _e:
+                import logging as _l
+                _l.getLogger("stoichima").warning("shots_df load failed: %s", _e)
+                shots_df = None
+
+        feature_df = build_features(
+            combined,
+            shots_df=shots_df,
+            xg_model=self.xg_model,
+            dist_model=self.dist_model,
+            db=db,
+        )
 
         if db is not None:
             feature_df = build_player_features(feature_df, db, competition=competition)
@@ -172,12 +306,14 @@ class Predictor:
         if self.multiline_model is not None:
             ml_probas = self.multiline_model.all_lines_proba(upcoming_feat)
 
-        # Per-team historical match counts for data quality warnings
+        # Per-team historical match counts for data quality warnings (vectorised)
         team_counts: dict[str, int] = {}
         if len(finished_df) > 0:
-            for _, r in finished_df.iterrows():
-                team_counts[r["home_team"]] = team_counts.get(r["home_team"], 0) + 1
-                team_counts[r["away_team"]] = team_counts.get(r["away_team"], 0) + 1
+            import collections
+            counts = collections.Counter(
+                list(finished_df["home_team"]) + list(finished_df["away_team"])
+            )
+            team_counts = dict(counts)
 
         results = []
         for i, (_, row) in enumerate(upcoming_feat.iterrows()):
@@ -193,12 +329,25 @@ class Predictor:
 
             markets: dict = {}
             xg_range: dict = {}
-            if self.dist_model is not None:
+            # Use international DC model for WC/EC/UNL/AFC/ASIA/CA/GOLD — club-trained
+            # DC has parameters drowned out by ~50k club matches and underpredicts
+            # international scoring rates.
+            _intl_comps = {
+                "WC", "EC", "UNL", "AFC", "ASIA", "CA", "GOLD",
+                "FRIENDLY",
+                "WCQ_EU", "WCQ_AF", "WCQ_AS", "WCQ_SA", "WCQ_CC", "WCQ_OC",
+            }
+            active_dist = (
+                self.dist_model_intl
+                if competition in _intl_comps and self.dist_model_intl is not None
+                else self.dist_model
+            )
+            if active_dist is not None:
                 try:
                     neutral = bool(row.get("is_neutral_venue", False))
-                    markets = self.dist_model.all_markets(home, away, neutral_venue=neutral)
+                    markets = active_dist.all_markets(home, away, neutral_venue=neutral)
                     # Expected goals range from DC lambda values (Poisson 10th–90th percentile)
-                    lam_h, lam_a = self.dist_model.get_lambdas(home, away, neutral_venue=neutral)
+                    lam_h, lam_a = active_dist.get_lambdas(home, away, neutral_venue=neutral)
                     from scipy.stats import poisson as _poisson
                     xg_range = {
                         "home_xg": round(lam_h, 2),
@@ -209,10 +358,84 @@ class Predictor:
                         "away_high": round(float(_poisson.ppf(0.90, lam_a)), 1),
                         "total_xg":  round(lam_h + lam_a, 2),
                     }
+
+                    # For international competitions, the XGB outcome model trained
+                    # on club data has no signal for national teams — it returns
+                    # ~uniform 51/24/25 priors. Blending too much of that pollutes
+                    # the DC signal. Use 85% DC / 15% ensemble: the small ensemble
+                    # contribution captures player-form data where it exists, but
+                    # the team-strength signal comes overwhelmingly from DC.
+                    if competition in _intl_comps:
+                        dc_outcome = markets.get("1x2", {})
+                        if dc_outcome:
+                            dc_h = dc_outcome.get("H", h_prob)
+                            dc_d = dc_outcome.get("D", d_prob)
+                            dc_a = dc_outcome.get("A", a_prob)
+                            h_prob = round(0.85 * dc_h + 0.15 * h_prob, 4)
+                            d_prob = round(0.85 * dc_d + 0.15 * d_prob, 4)
+                            a_prob = round(0.85 * dc_a + 0.15 * a_prob, 4)
+
+                            # ── Uniform-prior shrinkage for noisy / low-data matches ──
+                            # 1. FRIENDLY matches are inherently noisy (rotated squads,
+                            #    low stakes). Pull probabilities toward 33/33/33 to
+                            #    reduce overconfidence — gives proper credit when wrong.
+                            # 2. Low-data fallback: when either team has < 5 matches in
+                            #    the DC fit, ramp shrinkage up sharply since their
+                            #    attack/defense params are barely informed.
+                            shrink = 0.0
+                            if competition == "FRIENDLY":
+                                shrink += 0.30
+                            try:
+                                counts = getattr(active_dist, "team_match_counts", {}) or {}
+                                home_n = counts.get(home, 0)
+                                away_n = counts.get(away, 0)
+                                low_n  = min(home_n, away_n)
+                                if low_n < 5:
+                                    # Additional shrinkage: full 50% if one team has zero data,
+                                    # tapering to zero at >= 5 matches.
+                                    shrink += 0.50 * (1.0 - low_n / 5.0)
+                                shrink = min(shrink, 0.85)   # cap so we never go fully uniform
+                            except Exception:
+                                pass
+                            if shrink > 0.0:
+                                uniform = 1.0 / 3.0
+                                h_prob = (1 - shrink) * h_prob + shrink * uniform
+                                d_prob = (1 - shrink) * d_prob + shrink * uniform
+                                a_prob = (1 - shrink) * a_prob + shrink * uniform
+
+                            # ── Rotation penalty: if confirmed lineup is available and
+                            # the starting XI's combined xG-per-90 is materially below
+                            # the team's recent squad average, the model is over-fit to
+                            # the regular XI. Apply additional shrinkage in that case.
+                            try:
+                                rotation_shrink = _rotation_penalty_for_match(
+                                    db, home, away, row.get("match_date"),
+                                )
+                                if rotation_shrink > 0.0:
+                                    h_prob = (1 - rotation_shrink) * h_prob + rotation_shrink * (1/3)
+                                    d_prob = (1 - rotation_shrink) * d_prob + rotation_shrink * (1/3)
+                                    a_prob = (1 - rotation_shrink) * a_prob + rotation_shrink * (1/3)
+                            except Exception:
+                                pass
+
+                            # Renormalise (blending + shrinkage can drift slightly)
+                            total = h_prob + d_prob + a_prob
+                            if total > 0:
+                                h_prob = round(h_prob / total, 4)
+                                d_prob = round(d_prob / total, 4)
+                                a_prob = round(a_prob / total, 4)
+                            predicted_outcome = ["H", "D", "A"][int(np.argmax([h_prob, d_prob, a_prob]))]
                 except Exception:
                     markets = {}
 
             btts_prob = round(float(markets.get("btts", {}).get("yes", over25_prob * 0.7)), 4)
+
+            # Replace binary-model O2.5 with DC-derived O2.5 when available — the
+            # binary GoalsModel has the same club-data dilution issue as the outcome
+            # model, returning ~constant 0.40 for any international fixture.
+            dc_o25 = (markets.get("over_under") or {}).get("2.5", {}).get("over")
+            if dc_o25 is not None:
+                over25_prob = round(float(dc_o25), 4)
 
             # Confidence interval from component model disagreement
             component_probs = np.array([
@@ -221,20 +444,27 @@ class Predictor:
                 [player_form_proba[i][0], player_form_proba[i][1], player_form_proba[i][2]],
             ])
             prob_std = component_probs.std(axis=0)  # (3,)
+            # model_agreement: 1 = all models agree perfectly, 0 = max disagreement.
+            # std of a uniform [0,1] outcome is ≤ 0.5; normalise so max disagreement → 0.
+            model_agreement = round(float(np.clip(1.0 - prob_std.mean() * 2, 0.0, 1.0)), 3)
+
+            # Conformal prediction intervals (split-conformal, 90% coverage target).
+            # The conformal quantile is estimated from historical calibration residuals
+            # stored on the outcome model. Falls back to ±1.65*std (Gaussian approx).
+            q = getattr(self.outcome_model, "_conformal_q90", None)
+            if q is not None:
+                hw = float(q)
+            else:
+                hw_arr = 1.65 * prob_std  # Gaussian 90% half-widths per class
+
+            def _ci(p: float, hw_val: float) -> list:
+                return [round(max(0.0, p - hw_val), 4), round(min(1.0, p + hw_val), 4)]
+
             confidence = {
-                "home_win_ci": [
-                    round(max(0.0, float(h_prob - 1.65 * prob_std[0])), 4),
-                    round(min(1.0, float(h_prob + 1.65 * prob_std[0])), 4),
-                ],
-                "draw_ci": [
-                    round(max(0.0, float(d_prob - 1.65 * prob_std[1])), 4),
-                    round(min(1.0, float(d_prob + 1.65 * prob_std[1])), 4),
-                ],
-                "away_win_ci": [
-                    round(max(0.0, float(a_prob - 1.65 * prob_std[2])), 4),
-                    round(min(1.0, float(a_prob + 1.65 * prob_std[2])), 4),
-                ],
-                "model_agreement": round(float(1.0 - prob_std.mean() * 3), 3),  # 1=perfect agreement
+                "home_win_ci":   _ci(h_prob, hw_arr[0] if q is None else hw),
+                "draw_ci":       _ci(d_prob, hw_arr[1] if q is None else hw),
+                "away_win_ci":   _ci(a_prob, hw_arr[2] if q is None else hw),
+                "model_agreement": model_agreement,
             }
 
             # Corners O/U market from rolling feature averages

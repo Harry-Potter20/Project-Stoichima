@@ -42,6 +42,28 @@ COMPETITION_WEIGHTS: dict[str, dict] = {
     "PPL": {"outcome": 0.40, "bilstm": 0.37, "player_form": 0.23},
     "TSL": {"outcome": 0.35, "bilstm": 0.42, "player_form": 0.23},  # Turkish SL: volatile
     "GSL": {"outcome": 0.35, "bilstm": 0.42, "player_form": 0.23},
+
+    # ── International tournaments ──────────────────────────────────────────
+    # BiLSTM down-weighted: national teams play sparsely and 4-year cycles mean
+    # sequence context is stale. Player form up-weighted: a Mbappé/Messi-level
+    # availability decision swings probabilities dramatically.
+    "WC":   {"outcome": 0.50, "bilstm": 0.15, "player_form": 0.35},
+    "EC":   {"outcome": 0.50, "bilstm": 0.15, "player_form": 0.35},
+    "UNL":  {"outcome": 0.50, "bilstm": 0.20, "player_form": 0.30},  # more matches than WC
+    "AFC":  {"outcome": 0.55, "bilstm": 0.15, "player_form": 0.30},
+    "ASIA": {"outcome": 0.55, "bilstm": 0.15, "player_form": 0.30},
+    "CA":   {"outcome": 0.50, "bilstm": 0.15, "player_form": 0.35},
+    "GOLD": {"outcome": 0.55, "bilstm": 0.15, "player_form": 0.30},
+
+    # Friendlies — minimal context, model relies almost entirely on the base
+    # outcome model + DC. Player form less informative since lineups often
+    # rotate heavily in friendlies.
+    "FRIENDLY": {"outcome": 0.65, "bilstm": 0.10, "player_form": 0.25},
+    "WCQ_EU":   {"outcome": 0.55, "bilstm": 0.15, "player_form": 0.30},
+    "WCQ_AF":   {"outcome": 0.55, "bilstm": 0.15, "player_form": 0.30},
+    "WCQ_AS":   {"outcome": 0.55, "bilstm": 0.15, "player_form": 0.30},
+    "WCQ_SA":   {"outcome": 0.55, "bilstm": 0.15, "player_form": 0.30},
+    "WCQ_CC":   {"outcome": 0.55, "bilstm": 0.15, "player_form": 0.30},
 }
 
 

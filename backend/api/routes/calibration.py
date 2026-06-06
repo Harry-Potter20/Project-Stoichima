@@ -52,22 +52,8 @@ def _brier(probs: list[float], actuals: list[int]) -> float | None:
     return round(float(np.mean([(p - a) ** 2 for p, a in zip(probs, actuals)])), 4)
 
 
-@router.get("/calibration/{competition_id}")
-def get_calibration(competition_id: str, db: Session = Depends(get_db)):
-    resolved = db.query(Prediction).filter(
-        Prediction.competition == competition_id,
-        Prediction.actual_outcome != None,
-    ).all()
-
-    if not resolved:
-        return {
-            "competition": competition_id,
-            "resolved": 0,
-            "outcome": None,
-            "over_2_5": None,
-            "btts": None,
-        }
-
+def _build_calibration_payload(resolved: list, competition_id: str) -> dict:
+    """Build the calibration response dict from a list of resolved Prediction rows."""
     # ---- Outcome (H/D/A) — one reliability curve per class ----
     outcome_curves = {}
     for label, prob_attr in [("H", "home_win_prob"), ("D", "draw_prob"), ("A", "away_win_prob")]:
@@ -109,3 +95,56 @@ def get_calibration(competition_id: str, db: Session = Depends(get_db)):
             "resolved":    len(btts_resolved),
         },
     }
+
+
+@router.get("/calibration/{competition_id}")
+def get_calibration(competition_id: str, db: Session = Depends(get_db)):
+    resolved = db.query(Prediction).filter(
+        Prediction.competition == competition_id,
+        Prediction.actual_outcome != None,
+    ).all()
+
+    if not resolved:
+        return {
+            "competition": competition_id,
+            "resolved": 0,
+            "outcome": None,
+            "over_2_5": None,
+            "btts": None,
+        }
+
+    return _build_calibration_payload(resolved, competition_id)
+
+
+@router.get("/calibration")
+def get_calibration_all(db: Session = Depends(get_db)):
+    """
+    Per-competition Brier score summary across all competitions with resolved predictions.
+    Returns a flat list sorted by macro_brier ascending (best-calibrated first).
+    """
+    from sqlalchemy import distinct
+    competitions = [
+        row[0] for row in db.query(distinct(Prediction.competition))
+        .filter(Prediction.actual_outcome != None)
+        .all()
+    ]
+
+    results = []
+    for comp in competitions:
+        resolved = db.query(Prediction).filter(
+            Prediction.competition == comp,
+            Prediction.actual_outcome != None,
+        ).all()
+        if not resolved:
+            continue
+        payload = _build_calibration_payload(resolved, comp)
+        results.append({
+            "competition":  comp,
+            "resolved":     payload["resolved"],
+            "macro_brier":  payload["outcome"]["macro_brier"] if payload["outcome"] else None,
+            "ou_brier":     payload["over_2_5"]["brier_score"] if payload["over_2_5"] else None,
+            "btts_brier":   payload["btts"]["brier_score"] if payload["btts"] else None,
+        })
+
+    results.sort(key=lambda r: (r["macro_brier"] is None, r["macro_brier"] or 0))
+    return {"competitions": results}

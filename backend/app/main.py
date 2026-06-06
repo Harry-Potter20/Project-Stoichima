@@ -36,6 +36,9 @@ from api.routes.bankroll import router as bankroll_router
 from api.routes.tennis import router as tennis_router
 from api.routes.basketball import router as basketball_router
 from api.routes.telegram import router as telegram_router
+from api.routes.live import router as live_router
+from api.routes.player_props import router as player_props_router
+from api.routes.bet_builder_v2 import router as parlay_v2_router
 from fastapi.middleware.cors import CORSMiddleware
 from scheduler import create_scheduler
 
@@ -56,24 +59,98 @@ def _run_db_migrations():
             if col not in existing:
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}"))
 
-        # BetLog new columns
+        def _index(name: str, table: str, cols: str, unique: bool = False):
+            kind = "UNIQUE INDEX" if unique else "INDEX"
+            conn.execute(text(
+                f"CREATE {kind} IF NOT EXISTS {name} ON {table} ({cols})"
+            ))
+
+        # ── matches: columns added after initial schema ──────────────────────
+        _add("matches", "is_neutral_venue",   "INTEGER DEFAULT 0")
+        _add("matches", "tournament_stage",   "TEXT")
+        _add("matches", "tournament_group",   "TEXT")
+        _add("matches", "b365_home",          "REAL")
+        _add("matches", "b365_draw",          "REAL")
+        _add("matches", "b365_away",          "REAL")
+        _add("matches", "ps_home",            "REAL")
+        _add("matches", "ps_draw",            "REAL")
+        _add("matches", "ps_away",            "REAL")
+        _add("matches", "max_home",           "REAL")
+        _add("matches", "max_draw",           "REAL")
+        _add("matches", "max_away",           "REAL")
+        _add("matches", "avg_home",           "REAL")
+        _add("matches", "avg_draw",           "REAL")
+        _add("matches", "avg_away",           "REAL")
+        _add("matches", "api_football_id",    "INTEGER")
+        _add("matches", "sport",              "TEXT DEFAULT 'football'")
+        _add("matches", "referee",            "TEXT")
+        _add("matches", "opening_home_odds",  "REAL")
+        _add("matches", "opening_draw_odds",  "REAL")
+        _add("matches", "opening_away_odds",  "REAL")
+        _add("matches", "btts",               "INTEGER")
+        _add("matches", "over_1_5_goals",     "INTEGER")
+        _add("matches", "home_team_corners",  "INTEGER")
+        _add("matches", "away_team_corners",  "INTEGER")
+
+        # ── BetLog columns ───────────────────────────────────────────────────
         _add("bet_log", "closing_home_odds", "REAL")
         _add("bet_log", "closing_draw_odds",  "REAL")
         _add("bet_log", "closing_away_odds",  "REAL")
+        _add("bet_log", "clv_pct",        "REAL")
         _add("bet_log", "source",         "TEXT DEFAULT 'auto'")
         _add("bet_log", "notes",          "TEXT")
         _add("bet_log", "tags",           "TEXT")
         _add("bet_log", "market",         "TEXT DEFAULT '1x2'")
         _add("bet_log", "stake_amount",   "REAL")
 
-        # OddsSnapshot new columns
+        # ── OddsSnapshot columns ─────────────────────────────────────────────
         _add("odds_snapshots", "bk_home",    "TEXT")
         _add("odds_snapshots", "bk_draw",    "TEXT")
         _add("odds_snapshots", "bk_away",    "TEXT")
         _add("odds_snapshots", "arb_margin", "REAL")
 
-        # Prediction new columns
+        # ── Prediction columns ───────────────────────────────────────────────
         _add("predictions", "model_version", "TEXT")
+        _add("predictions", "sport",         "TEXT DEFAULT 'football'")
+
+        # ── Live tracking columns (idempotent — Base.metadata.create_all
+        # already created the tables; these ALTERs cover cases where the
+        # tables existed before columns were added in subsequent revisions).
+        _add("live_match_state", "prematch_lambda_home", "REAL")
+        _add("live_match_state", "prematch_lambda_away", "REAL")
+        _add("live_match_state", "home_yellow_cards",    "INTEGER DEFAULT 0")
+        _add("live_match_state", "away_yellow_cards",    "INTEGER DEFAULT 0")
+
+        # ── Indexes for hot query paths ───────────────────────────────────────
+        # Predictions route: filter matches by competition + status
+        _index("ix_matches_comp_status", "matches", "competition, status")
+        # Scheduler resolution: look up finished matches by competition + date
+        _index("ix_matches_comp_date",   "matches", "competition, match_date")
+        # BetLog daily Kelly query: filter by created_at date
+        _index("ix_bet_log_created_at",  "bet_log", "created_at")
+        # Prediction resolution: look up by competition + match date
+        _index("ix_predictions_comp_date", "predictions", "competition, match_date")
+
+        # ── Unique constraint: one prediction per fixture per run ─────────────
+        # Prevents duplicate rows when the endpoint is polled repeatedly.
+        # Dedup existing rows first so the unique index creation never fails on
+        # data that predates the constraint (keeps the row with the lowest id).
+        idx_exists = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='index' AND name='uq_predictions_fixture'")
+        ).fetchone()
+        if not idx_exists:
+            conn.execute(text(
+                "DELETE FROM predictions WHERE id NOT IN ("
+                "  SELECT MIN(id) FROM predictions"
+                "  GROUP BY competition, home_team, away_team, match_date"
+                ")"
+            ))
+        _index(
+            "uq_predictions_fixture",
+            "predictions",
+            "competition, home_team, away_team, match_date",
+            unique=True,
+        )
 
         conn.commit()
 
@@ -128,6 +205,9 @@ app.include_router(bankroll_router,    prefix="/api/v1", tags=["bankroll"])
 app.include_router(tennis_router,      prefix="/api/v1", tags=["tennis"])
 app.include_router(basketball_router,  prefix="/api/v1", tags=["basketball"])
 app.include_router(telegram_router,    tags=["telegram"])
+app.include_router(live_router,        prefix="/api/v1", tags=["live"])
+app.include_router(player_props_router, prefix="/api/v1", tags=["player_props"])
+app.include_router(parlay_v2_router,    prefix="/api/v1", tags=["parlay_v2"])
 
 @app.get("/")
 def root():
@@ -141,6 +221,64 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+
+@app.post("/admin/backup", tags=["admin"])
+def manual_backup(tag: str = "manual"):
+    """Create a timestamped DB backup. Returns path + total backup count."""
+    from utils.db_backup import backup_db, list_backups
+    path = backup_db(tag)
+    return {"backup_path": path, "total_backups": len(list_backups())}
+
+
+@app.get("/admin/backups", tags=["admin"])
+def list_db_backups():
+    """List existing DB backups, newest first."""
+    from utils.db_backup import list_backups
+    return {"backups": list_backups()}
+
+
+@app.post("/admin/refresh-friendlies", tags=["admin"])
+def manual_refresh_friendlies():
+    """Manually trigger the FRIENDLY/MAR/BSA refresh + resolution + morning digest."""
+    from scheduler import _refresh_daily_friendlies
+    _refresh_daily_friendlies()
+    return {"status": "friendly refresh triggered (check logs + Telegram)"}
+
+
+@app.post("/admin/live-poll", tags=["admin"])
+def manual_live_poll():
+    """Trigger an immediate live-match poll (test the per-minute job)."""
+    from data_collection.live_match_ingest import run_live_poll
+    return run_live_poll()
+
+
+@app.post("/admin/wc-digest", tags=["admin"])
+def manual_wc_digest():
+    """Manually trigger today's WC Telegram digest (test the daily 08:00 UTC job)."""
+    from scheduler import _send_daily_wc_digest
+    _send_daily_wc_digest()
+    return {"status": "wc digest fired (check Telegram)"}
+
+
+@app.post("/admin/wc-preview", tags=["admin"])
+def manual_wc_preview(n: int = 8):
+    """
+    Send a Telegram preview of the next N upcoming WC/EC matches with
+    probabilities — ignores the 24h window used by the daily digest.
+    Useful before the tournament starts.
+    """
+    from scheduler import _send_tournament_preview
+    _send_tournament_preview(n)
+    return {"status": f"preview fired for next {n} matches"}
+
+
+@app.post("/admin/prematch-alerts", tags=["admin"])
+def manual_prematch_alerts():
+    """Manually trigger pre-match alerts (matches starting in 30–45 min)."""
+    from scheduler import _send_prematch_telegram_reminders
+    _send_prematch_telegram_reminders()
+    return {"status": "prematch alerts fired"}
 
 
 @app.post("/admin/refresh", tags=["admin"])
@@ -218,6 +356,25 @@ def recalibrate_elo(competition: str = "WC"):
     return {"status": "ok", "competition": competition, "teams_updated": updated}
 
 
+@app.post("/admin/clear-pending-bets", tags=["admin"])
+def clear_pending_bets(competition: str | None = None):
+    """
+    Delete pending (unsettled) BetLog rows. Backs up the DB first.
+    Pass ?competition=WC to scope deletion to one competition.
+    """
+    from utils.db_backup import backup_db
+    from app.database import SessionLocal
+    from app.models import BetLog
+    backup_path = backup_db(f"clear_pending_{competition or 'all'}")
+    with SessionLocal() as db:
+        q = db.query(BetLog).filter(BetLog.won.is_(None))
+        if competition:
+            q = q.filter(BetLog.competition == competition)
+        n = q.delete()
+        db.commit()
+    return {"deleted": n, "competition": competition or "all", "backup": backup_path}
+
+
 @app.post("/admin/retrain", tags=["admin"])
 def manual_retrain():
     """Kick off a background model retrain (runs train_models.py in a subprocess)."""
@@ -265,8 +422,9 @@ def model_drift():
         return round(sum(1 for p in preds if p.predicted_outcome == p.actual_outcome) / len(preds), 4)
 
     cutoff = datetime.utcnow() - timedelta(days=30)
-    recent   = [p for p in resolved if p.match_date and p.match_date >= cutoff.date()]
-    historic = [p for p in resolved if p.match_date and p.match_date < cutoff.date()]
+    # Prediction.match_date is a DateTime column → Python datetime; compare directly.
+    recent   = [p for p in resolved if p.match_date and p.match_date >= cutoff]
+    historic = [p for p in resolved if p.match_date and p.match_date < cutoff]
 
     hist_acc   = _acc(historic)
     recent_acc = _acc(recent)

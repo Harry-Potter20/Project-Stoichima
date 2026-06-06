@@ -99,6 +99,13 @@ class GoalsDistributionModel:
         ag_arr   = df["away_team_score"].values.astype(int)
         w_arr    = df["weight"].values
 
+        # Neutral-venue mask: home_advantage applies only to genuine home games.
+        # Tournament/cup neutral-venue matches must not pull the scalar downward.
+        if "is_neutral_venue" in df.columns:
+            home_adv_mask = (df["is_neutral_venue"].fillna(0).astype(int) == 0).astype(float).values
+        else:
+            home_adv_mask = np.ones(len(df))
+
         # Fix first team's attack to 0 for identifiability (reference team).
         # Free params: attack[1..n-1], defense[0..n-1], home_adv, rho
         def _neg_ll_fixed(params):
@@ -109,7 +116,7 @@ class GoalsDistributionModel:
             home_adv = params[2 * n - 1]
             rho      = params[2 * n]
 
-            lh = np.exp(attack_free[home_idx] + defense[away_idx] + home_adv)
+            lh = np.exp(attack_free[home_idx] + defense[away_idx] + home_adv * home_adv_mask)
             la = np.exp(attack_free[away_idx] + defense[home_idx])
 
             # Vectorised Poisson log-PMF
@@ -152,8 +159,28 @@ class GoalsDistributionModel:
         attack_full[0] = 0.0
         attack_full[1:] = params[:n - 1]
         defense = params[n - 1:2 * n - 1]
-        self.attack         = {t: float(attack_full[i]) for t, i in team_idx.items()}
-        self.defense        = {t: float(defense[i])     for t, i in team_idx.items()}
+
+        # Count effective matches per team for shrinkage. Use match counts as
+        # the precision of the per-team estimate; teams with few matches get
+        # pulled toward the league mean (empirical Bayes / James-Stein).
+        team_match_counts = np.zeros(n)
+        np.add.at(team_match_counts, home_idx, 1)
+        np.add.at(team_match_counts, away_idx, 1)
+
+        # Shrinkage strength k: equivalent to "k extra matches of league-avg data".
+        # Use a MATCH-WEIGHTED league mean as the prior — otherwise 100+ minnow
+        # teams with 1-2 matches each pull the prior down and unfairly punish
+        # elite teams with small samples (e.g. Brazil at 9 WC matches).
+        k = 4.0
+        league_attack  = float(np.average(attack_full, weights=team_match_counts))
+        league_defense = float(np.average(defense,     weights=team_match_counts))
+        w = team_match_counts / (team_match_counts + k)
+        attack_shrunk  = w * attack_full + (1 - w) * league_attack
+        defense_shrunk = w * defense     + (1 - w) * league_defense
+
+        self.attack         = {t: float(attack_shrunk[i])  for t, i in team_idx.items()}
+        self.defense        = {t: float(defense_shrunk[i]) for t, i in team_idx.items()}
+        self.team_match_counts = {t: int(team_match_counts[i]) for t, i in team_idx.items()}
         self.home_advantage = float(params[2 * n - 1])
         self.rho            = float(params[2 * n])
 
@@ -305,6 +332,42 @@ class GoalsDistributionModel:
                 })
         return sorted(scores, key=lambda x: x["probability"], reverse=True)[:top_n]
 
+    def market_first_to_score(
+        self, home_team: str, away_team: str, neutral_venue: bool = False
+    ) -> dict:
+        """
+        First-to-score probabilities derived from the two Poisson processes.
+        For competing exponential first-arrival times with rates λ_h and λ_a:
+            P(home scores first | a goal is scored) = λ_h / (λ_h + λ_a)
+        We also return P(no goal) from the score matrix's [0,0] cell.
+        """
+        a_h_val  = self.attack.get(home_team,  float(np.mean(list(self.attack.values()))))
+        d_h_val  = self.defense.get(home_team, float(np.mean(list(self.defense.values()))))
+        a_a_val  = self.attack.get(away_team,  float(np.mean(list(self.attack.values()))))
+        d_a_val  = self.defense.get(away_team, float(np.mean(list(self.defense.values()))))
+        home_adv = 0.0 if neutral_venue else self.home_advantage
+
+        lam_h = float(np.exp(a_h_val + d_a_val + home_adv))
+        lam_a = float(np.exp(a_a_val + d_h_val))
+
+        # P(no goal in 90 min) — DC matrix [0,0]
+        matrix = self.predict_score_matrix(home_team, away_team, neutral_venue=neutral_venue)
+        p_no_goal = float(matrix[0, 0])
+
+        # Given at least one goal, which team scored first?
+        total = lam_h + lam_a
+        p_home_first_given_goal = (lam_h / total) if total > 0 else 0.5
+        p_away_first_given_goal = (lam_a / total) if total > 0 else 0.5
+
+        # Marginalise over "at least one goal"
+        p_at_least_one = 1.0 - p_no_goal
+        return {
+            "home":    round(p_at_least_one * p_home_first_given_goal, 4),
+            "away":    round(p_at_least_one * p_away_first_given_goal, 4),
+            "no_goal": round(p_no_goal, 4),
+        }
+
+
     def all_markets(self, home_team: str, away_team: str, neutral_venue: bool = False) -> dict:
         """Convenience: compute everything in one call."""
         matrix = self.predict_score_matrix(home_team, away_team, neutral_venue=neutral_venue)
@@ -314,6 +377,7 @@ class GoalsDistributionModel:
             "dnb":            self.market_dnb(matrix),
             "wbtts":          self.market_wbtts(matrix),
             "double_chance":  self.market_double_chance(matrix),
+            "first_to_score": self.market_first_to_score(home_team, away_team, neutral_venue=neutral_venue),
             "over_under": {
                 "1.5": self.market_over_under(matrix, 1.5),
                 "2.5": self.market_over_under(matrix, 2.5),

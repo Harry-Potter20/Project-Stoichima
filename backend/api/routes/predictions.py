@@ -6,6 +6,7 @@ import pandas as pd
 from datetime import datetime
 from prediction.predictor import get_predictor
 import prediction.cache as pred_cache
+from utils.betting import kelly_fraction_stake
 
 
 def _prediction_ttl(upcoming_matches) -> int:
@@ -32,6 +33,9 @@ def _prediction_ttl(upcoming_matches) -> int:
 EDGE_THRESHOLD   = 3.0   # minimum edge % to auto-log a simulated bet
 KELLY_FRACTION   = 0.25  # fractional Kelly multiplier
 MIN_MODEL_PROB   = 0.28  # model must assign >= 28% to the bet outcome (stops low-confidence edges)
+MAX_DECIMAL_ODDS = 8.0   # never bet odds above this (longshot guard — sharp markets rarely err this hard)
+MIN_IMPLIED_PROB = 0.10  # market implies <10%? skip — claimed "value" on extreme outsiders is almost always model error
+MAX_EDGE_RATIO   = 2.5   # model_prob / implied_prob cap — anything above ~2.5x is implausible
 
 router = APIRouter()
 
@@ -59,6 +63,8 @@ def _matches_to_df(matches, include_result: bool = True) -> pd.DataFrame:
             "opening_home_odds":    getattr(m, "opening_home_odds", None),
             "opening_draw_odds":    getattr(m, "opening_draw_odds", None),
             "opening_away_odds":    getattr(m, "opening_away_odds", None),
+            "is_neutral_venue":     bool(getattr(m, "is_neutral_venue", False) or False),
+            "competition":          getattr(m, "competition", None),
         }
         if include_result:
             row["result"] = m.result
@@ -109,16 +115,26 @@ def get_predictions(competition_id: str, db: Session = Depends(get_db)):
     predictor = get_predictor()
     predictions = predictor.predict(upcoming_df, finished_df, db=db, competition=competition_id)
 
-    # Persist prediction records
+    # Persist prediction records — upsert: skip if a row already exists for
+    # this fixture (prevents duplicates when the endpoint is polled repeatedly).
     from app.config import get_settings as _gs
     _model_ver = _gs().model_version
     for pred in predictions:
         meta = pred["_meta"]
+        match_ts = pd.Timestamp(pred["match_date"])
+        existing_pred = db.query(Prediction).filter(
+            Prediction.competition == competition_id,
+            Prediction.home_team  == pred["home_team"],
+            Prediction.away_team  == pred["away_team"],
+            Prediction.match_date == match_ts,
+        ).first()
+        if existing_pred:
+            continue
         record = Prediction(
             competition=competition_id,
             home_team=pred["home_team"],
             away_team=pred["away_team"],
-            match_date=pd.Timestamp(pred["match_date"]),
+            match_date=match_ts,
             predicted_outcome=meta["predicted_outcome"],
             home_win_prob=meta["home_win_prob"],
             draw_prob=meta["draw_prob"],
@@ -226,14 +242,21 @@ def _auto_log_bets(predictions: list[dict], competition_id: str, db: Session):
     outcome_keys = {"home": "H", "draw": "D", "away": "A"}
     prob_keys    = {"home": "home_win_prob", "draw": "draw_prob", "away": "away_win_prob"}
 
+    # Hoist the daily-used query above the loop — one DB round-trip total.
+    daily_used = _daily_kelly_used(db)
+
     for pred in predictions:
         edge_map = pred.get("edge") or {}
         odds_map = pred.get("odds") or {}
         if not edge_map or not odds_map:
             continue
 
-        best_key = max(edge_map, key=lambda k: edge_map.get(k, -999))
-        best_edge = edge_map.get(best_key, 0)
+        # Only consider 1x2 markets for auto-logging; skip over/btts edge keys.
+        eligible = {k: v for k, v in edge_map.items() if k in outcome_keys}
+        if not eligible:
+            continue
+        best_key = max(eligible, key=lambda k: eligible[k])
+        best_edge = eligible[best_key]
         if best_edge < EDGE_THRESHOLD:
             continue
 
@@ -242,18 +265,28 @@ def _auto_log_bets(predictions: list[dict], competition_id: str, db: Session):
         if not decimal_odds or decimal_odds <= 1:
             continue
 
-        model_prob   = pred["outcome"].get(prob_keys[best_key], 0.0)
+        # Longshot guard — sharp markets rarely misprice this hard. Skip odds above cap.
+        if decimal_odds > MAX_DECIMAL_ODDS:
+            continue
+
+        model_prob = pred["outcome"].get(prob_keys[best_key], 0.0)
         # Confidence gate: skip if model assigns < MIN_MODEL_PROB to this outcome
         if model_prob < MIN_MODEL_PROB:
             continue
 
         implied_prob = 1.0 / decimal_odds
-        b            = decimal_odds - 1
-        kelly_full   = max(0.0, (model_prob * b - (1 - model_prob)) / b)
-        kelly_stake  = round(kelly_full * KELLY_FRACTION * 100, 2)  # as % of bankroll
+        # Implied-prob floor — anything the market thinks is <10% likely is filtered out
+        if implied_prob < MIN_IMPLIED_PROB:
+            continue
 
-        # Re-check cap before each individual bet (prior iterations may have filled it)
-        daily_used = _daily_kelly_used(db)
+        # Edge-ratio cap — model_prob/implied_prob > 2.5 means we're claiming the market
+        # is wildly wrong; almost always a calibration/data error, not real value.
+        if model_prob / implied_prob > MAX_EDGE_RATIO:
+            continue
+
+        kelly_stake  = kelly_fraction_stake(model_prob, decimal_odds, KELLY_FRACTION)
+
+        # Cap check using the already-fetched daily_used value
         if daily_used + kelly_stake > s.max_daily_kelly_pct:
             break
 

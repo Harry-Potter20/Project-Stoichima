@@ -3,6 +3,7 @@ import PredictionsTable from './components/PredictionsTable';
 import AccuracyTracker from './components/AccuracyTracker';
 import CalibrationChart from './components/CalibrationChart';
 import TournamentView from './components/TournamentView';
+import LiveView from './components/LiveView';
 import CLVChart from './components/CLVChart';
 import BankrollChart from './components/BankrollChart';
 import BettingBot from './components/BettingBot';
@@ -40,6 +41,7 @@ const OTHER_EUROPEAN = [
 ];
 
 const TABS = [
+  { id: 'live',         label: '📺 Live' },
   { id: 'predictions',  label: 'Predictions' },
   { id: 'accuracy',     label: 'Accuracy' },
   { id: 'calibration',  label: 'Calibration' },
@@ -94,6 +96,13 @@ function App() {
           </div>
         </div>
       </nav>
+
+      {/* ── Live tab ────────────────────────────────────────────────────── */}
+      {tab === 'live' && (
+        <main className="max-w-6xl mx-auto px-6 py-8">
+          <LiveView />
+        </main>
+      )}
 
       {/* ── Predictions tab ─────────────────────────────────────────────── */}
       {tab === 'predictions' && (

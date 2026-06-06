@@ -6,12 +6,30 @@ EXCEPTIONS = {
     "Manchester City": "Man City",
     "Wolverhampton Wanderers": "Wolves",
     "Brighton & Hove Albion": "Brighton",
-    "Newcastle United": "Newcastle", 
+    "Newcastle United": "Newcastle",
     "Tottenham Hotspur": "Tottenham",
     "Nottingham Forest": "Nott'm Forest",
     "AFC Bournemouth": "Bournemouth",
     "West Ham United": "West Ham",
-    "Leeds United": "Leeds"
+    "Leeds United": "Leeds",
+
+    # National teams — API-Football short names → football-data.org canonical
+    "USA":                "United States",
+    "South-Korea":        "South Korea",
+    "Korea Republic":     "South Korea",
+    "Cote d'Ivoire":      "Ivory Coast",
+    "Côte d'Ivoire":      "Ivory Coast",
+    "Czech Republic":     "Czechia",
+    "Bosnia":             "Bosnia-Herzegovina",
+    "Bosnia and Herzegovina": "Bosnia-Herzegovina",
+    "Curacao":            "Curaçao",
+    "DR Congo":           "Congo DR",
+    "Democratic Republic of the Congo": "Congo DR",
+    "Cape Verde Islands": "Cape Verde",
+    "Trinidad And Tobago": "Trinidad and Tobago",
+    "St. Kitts and Nevis": "Saint Kitts and Nevis",
+    "Türkiye":            "Turkey",
+    "North Macedonia":    "Macedonia",
 }
 PREFIXES = ["FC ", "CF ", "AFC ", "SC "]
 SUFFIXES = [" FC", " CF", " AFC", " SC"]

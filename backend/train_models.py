@@ -57,11 +57,13 @@ def _load_matches() -> tuple[pd.DataFrame, pd.DataFrame]:
     } for m in matches])
 
     raw_df = pd.DataFrame([{
-        "home_team":       m.home_team,
-        "away_team":       m.away_team,
-        "match_date":      m.match_date,
-        "home_team_score": m.home_team_score,
-        "away_team_score": m.away_team_score,
+        "home_team":        m.home_team,
+        "away_team":        m.away_team,
+        "match_date":       m.match_date,
+        "home_team_score":  m.home_team_score,
+        "away_team_score":  m.away_team_score,
+        "competition":      m.competition,
+        "is_neutral_venue": m.is_neutral_venue or 0,
     } for m in matches])
 
     return feature_df, raw_df
@@ -151,6 +153,58 @@ def train_goals_distribution(raw_df: pd.DataFrame):
         mlflow.set_tag("artifact_pkl", f"runs:/{run_id}/models/goals_distribution.pkl")
 
     print("  ✓ saved_models/goals_distribution.pkl")
+    return model
+
+
+def train_goals_distribution_intl(raw_df: pd.DataFrame):
+    """
+    Dedicated DC model trained ONLY on international matches.
+    Club-trained DC has ~50k matches that drown out the ~700 international
+    matches in MLE fitting; team-strength parameters collapse toward zero,
+    causing all international xG predictions to cluster around 1.0 goals.
+    A separate intl-only fit gives realistic parameter spread.
+    """
+    print("\n[1b/6] GoalsDistributionModel-intl (Dixon-Coles, international only)")
+    intl_codes = {"WC", "EC", "UNL", "AFC", "ASIA", "CA", "GOLD"}
+    if "competition" in raw_df.columns:
+        intl_df = raw_df[raw_df["competition"].isin(intl_codes)].copy()
+    else:
+        # raw_df may not include competition; rebuild from DB directly
+        from app.models import Match
+        db = SessionLocal()
+        rows = db.query(Match).filter(
+            Match.status == "FINISHED",
+            Match.competition.in_(list(intl_codes)),
+        ).all()
+        db.close()
+        intl_df = pd.DataFrame([{
+            "home_team":       m.home_team,
+            "away_team":       m.away_team,
+            "match_date":      m.match_date,
+            "home_team_score": m.home_team_score,
+            "away_team_score": m.away_team_score,
+            "is_neutral_venue": 1,
+        } for m in rows])
+
+    if len(intl_df) < 100:
+        print(f"  skipped: only {len(intl_df)} international matches (need ≥100)")
+        return None
+
+    intl_df = intl_df.copy()
+    intl_df["is_neutral_venue"] = 1   # international fixtures are neutral
+
+    with model_run("goals_distribution_intl", tags={"model_type": "dixon_coles_intl"}):
+        log_dataset_info(intl_df)
+        model = GoalsDistributionModel()
+        model.fit(intl_df)
+        model.save("saved_models/goals_distribution_intl.pkl")
+        mlflow.log_params({
+            "n_matches":      len(intl_df),
+            "n_teams":        len(model.teams),
+            "home_advantage": round(model.home_advantage, 4),
+            "rho":            round(model.rho, 4),
+        })
+    print(f"  ✓ saved_models/goals_distribution_intl.pkl ({len(model.teams)} teams)")
     return model
 
 
@@ -451,6 +505,9 @@ def run():
 
     # [1/6] Train DC model first — feature_engineering needs it for dc_* columns
     dist_model_inst = train_goals_distribution(raw_df)
+    # [1b/6] Also fit a separate international-only DC so WC/EC predictions
+    # aren't drowned out by club matches in the global MLE.
+    train_goals_distribution_intl(raw_df)
 
     # Build all features in one pass, including DC probabilities
     db = SessionLocal()
@@ -534,6 +591,19 @@ def _train_and_return_outcome(
                         xgb_params=best_params or None, feature_override=pruned)
 
         metrics = model.evaluate(df)
+
+        # Conformal calibration: use the chronologically last 20% as calibration set
+        df_sorted = df.sort_values("match_date") if "match_date" in df.columns else df
+        calib_start = int(len(df_sorted) * 0.8)
+        calib_df = df_sorted.iloc[calib_start:]
+        if len(calib_df) >= 30:
+            try:
+                model.compute_conformal_q90(calib_df)
+                mlflow.log_metric("conformal_q90", round(float(model._conformal_q90), 4))
+                print(f"  ✓ conformal q90={model._conformal_q90:.4f}")
+            except Exception as _ce:
+                print(f"  ⚠ conformal calibration skipped: {_ce}")
+
         model.save("saved_models/match_outcome.pkl")
         mlflow.log_metrics({**metrics, "n_features_after_pruning": len(pruned)})
         mlflow.sklearn.log_model(

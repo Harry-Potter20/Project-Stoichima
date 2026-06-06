@@ -77,3 +77,6 @@ api_keys.json
 
 # OS
 Thumbs.db
+
+# Lock files
+*.lock

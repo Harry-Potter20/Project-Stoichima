@@ -17,6 +17,7 @@ import io
 import csv
 from typing import Optional
 from datetime import datetime
+from utils.betting import kelly_fraction_stake
 
 router = APIRouter()
 
@@ -236,9 +237,7 @@ def get_parlay(
         combined_odds  *= b.decimal_odds
 
     ev = round(combined_prob * combined_odds - 1.0, 4)  # expected profit per unit
-    b_val = combined_odds - 1
-    kelly_full  = max(0.0, (combined_prob * b_val - (1 - combined_prob)) / b_val) if b_val > 0 else 0.0
-    kelly_stake = round(kelly_full * 0.25 * 100, 2)      # quarter Kelly as % of bankroll
+    kelly_stake = kelly_fraction_stake(combined_prob, combined_odds, KELLY_FRACTION)
     stake_amt   = round(bankroll * kelly_stake / 100, 2)
 
     return {
@@ -347,9 +346,7 @@ def log_manual_bet(body: ManualBetIn, db: Session = Depends(get_db)):
     edge_pct = round((body.model_prob - implied) * 100, 2)
 
     # Kelly sizing
-    b = body.decimal_odds - 1
-    kelly_full = max(0.0, (body.model_prob * b - (1 - body.model_prob)) / b) if b > 0 else 0.0
-    kelly_pct = round(kelly_full * KELLY_FRACTION * 100, 2)
+    kelly_pct = kelly_fraction_stake(body.model_prob, body.decimal_odds, KELLY_FRACTION)
     stake_pct = body.stake_pct if body.stake_pct is not None else kelly_pct
     stake_amt = round(bankroll * stake_pct / 100, 2)
 

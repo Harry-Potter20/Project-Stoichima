@@ -174,7 +174,7 @@ def _resolve_predictions():
                 )
                 bet.resolved_at = datetime.utcnow()
 
-                # Attach closing odds for CLV
+                # Attach closing odds and compute CLV at settlement time
                 if snap_map:
                     try:
                         snap = snap_map.get((_norm(bet.home_team), _norm(bet.away_team)))
@@ -182,6 +182,10 @@ def _resolve_predictions():
                             bet.closing_home_odds = snap.home_odds
                             bet.closing_draw_odds = snap.draw_odds
                             bet.closing_away_odds = snap.away_odds
+                            closing_map = {"H": snap.home_odds, "D": snap.draw_odds, "A": snap.away_odds}
+                            closing = closing_map.get(bet.bet_on)
+                            if closing and closing > 1 and bet.decimal_odds:
+                                bet.clv_pct = round((bet.decimal_odds / closing - 1) * 100, 2)
                     except Exception:
                         pass
 
@@ -239,17 +243,89 @@ def _poll_lineups():
     log.info("Scheduler: polling lineups…")
     try:
         from data_collection.api_football_client import collect_lineups_for_upcoming
+        from app.database import SessionLocal
+        from app.models import ConfirmedLineup, Prediction, Match
+        from datetime import datetime, timedelta
         import prediction.cache as pred_cache
 
         updated = collect_lineups_for_upcoming()
-        if updated > 0:
-            # New lineup data available — force re-prediction on next request
-            pred_cache.invalidate()
-            log.info("Scheduler: %d lineup records updated, cache cleared", updated)
-        else:
+        if not updated:
             log.info("Scheduler: no new lineups")
+            return
+
+        # Find which fixtures had lineup changes in the last 30 min — these are
+        # the predictions we need to regenerate.
+        cutoff = datetime.utcnow() - timedelta(minutes=30)
+        with SessionLocal() as db:
+            recent_lineups = (
+                db.query(ConfirmedLineup)
+                .filter(ConfirmedLineup.confirmed_at >= cutoff)
+                .all()
+            )
+            affected_match_ids = {l.match_id for l in recent_lineups if l.match_id}
+            n_deleted = 0
+            if affected_match_ids:
+                affected_matches = (
+                    db.query(Match)
+                    .filter(Match.id.in_(list(affected_match_ids)))
+                    .all()
+                )
+                # Predictions are stored by (competition, home_team, away_team, match_date),
+                # not by match_id directly. Delete by tuple.
+                for m in affected_matches:
+                    n = (
+                        db.query(Prediction)
+                        .filter(
+                            Prediction.competition == m.competition,
+                            Prediction.home_team   == m.home_team,
+                            Prediction.away_team   == m.away_team,
+                            Prediction.match_date  == m.match_date,
+                        )
+                        .delete()
+                    )
+                    n_deleted += n
+                    # Push Telegram alert summarising the lineup
+                    try:
+                        _push_lineup_alert(db, m, recent_lineups)
+                    except Exception as exc:
+                        log.warning("lineup alert failed: %s", exc)
+                db.commit()
+
+        pred_cache.invalidate()
+        log.info("Scheduler: %d lineup records updated, %d stored predictions cleared, cache busted",
+                 updated, n_deleted)
     except Exception as e:
         log.error("Scheduler: lineup poll error: %s", e)
+
+
+def _push_lineup_alert(db, match, recent_lineups):
+    """Send a Telegram alert when a confirmed lineup drops for a tracked match."""
+    from app.config import get_settings
+    s = get_settings()
+    if not s.telegram_bot_token or not s.telegram_chat_id:
+        return
+
+    # Find the two confirmed lineups for this match
+    home_l = next((l for l in recent_lineups if l.match_id == match.id and l.team == match.home_team), None)
+    away_l = next((l for l in recent_lineups if l.match_id == match.id and l.team == match.away_team), None)
+    if not (home_l or away_l):
+        return
+
+    lines = [
+        f"📋 *Lineup Confirmed* — [{match.competition}]",
+        f"⚽ {match.home_team} v {match.away_team}",
+    ]
+    if home_l:
+        starters = (home_l.starters or "").split(",")[:11]
+        lines.append(f"\n*{match.home_team} XI:*")
+        lines.append(", ".join(s.strip() for s in starters if s.strip()))
+    if away_l:
+        starters = (away_l.starters or "").split(",")[:11]
+        lines.append(f"\n*{match.away_team} XI:*")
+        lines.append(", ".join(s.strip() for s in starters if s.strip()))
+    lines.append("\n_Predictions regenerating with confirmed squads — check /match again in 30s_")
+
+    _send_telegram("\n".join(lines))
 
 
 def _fetch_closing_odds():
@@ -623,6 +699,352 @@ def _retrain_models():
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _refresh_daily_friendlies():
+    """
+    Daily ingest of FRIENDLY + other API-Football-tracked competitions.
+    Runs once quota resets to capture overnight results so /results works
+    against fresh data.
+    """
+    try:
+        from data_collection.api_football_daily import run, LEAGUE_MAP
+        # Pull the last 2 days (catches anything that finished overnight) + next 4
+        from datetime import date as _date, timedelta as _td
+        log.info("Scheduler: refreshing FRIENDLY/MAR/BSA/etc. fixtures …")
+        result = run(list(LEAGUE_MAP.keys()), days=6)
+        log.info("Scheduler: daily fixture refresh — %d merged", result.get("total", 0))
+
+        # Re-resolve predictions for any matches that just transitioned to FINISHED
+        _resolve_predictions()
+
+        # Push a morning digest with predictions-vs-actuals so the user sees model
+        # performance over their morning coffee.
+        try:
+            _send_morning_results_digest()
+        except Exception as exc:
+            log.warning("morning digest failed: %s", exc)
+    except Exception as e:
+        log.error("Scheduler: friendly refresh error: %s", e)
+
+
+def _send_morning_results_digest():
+    """Telegram digest of yesterday's results + accuracy across all matches that resolved."""
+    from app.config import get_settings
+    s = get_settings()
+    if not s.telegram_bot_token or not s.telegram_chat_id:
+        return
+
+    from app.database import SessionLocal
+    from app.models import Prediction
+    from datetime import datetime, timedelta
+    cutoff = datetime.utcnow() - timedelta(hours=36)
+    with SessionLocal() as db:
+        resolved = (
+            db.query(Prediction)
+            .filter(
+                Prediction.actual_outcome.isnot(None),
+                Prediction.resolved_at >= cutoff,
+            )
+            .order_by(Prediction.match_date.desc())
+            .all()
+        )
+    if not resolved:
+        log.info("morning digest: no newly-resolved predictions")
+        return
+
+    correct = sum(1 for p in resolved if p.predicted_outcome == p.actual_outcome)
+    n = len(resolved)
+    acc = correct / n * 100
+    by_comp = {}
+    for p in resolved:
+        by_comp.setdefault(p.competition, []).append(p)
+
+    lines = [
+        f"☕ *Overnight Results* — Model vs Actual",
+        f"_{n} matches resolved · {correct}/{n} correct ({acc:.0f}%)_\n",
+    ]
+    for comp, preds in by_comp.items():
+        comp_correct = sum(1 for p in preds if p.predicted_outcome == p.actual_outcome)
+        lines.append(f"\n*{comp}* — {comp_correct}/{len(preds)} correct")
+        for p in sorted(preds, key=lambda x: x.match_date):
+            mark = "✅" if p.predicted_outcome == p.actual_outcome else "❌"
+            top_prob = max(p.home_win_prob, p.draw_prob, p.away_win_prob)
+            lines.append(
+                f"  {mark} {p.home_team} v {p.away_team}  → predicted *{p.predicted_outcome}* "
+                f"({top_prob*100:.0f}%) · actual *{p.actual_outcome}*"
+            )
+
+    _send_telegram("\n".join(lines))
+    log.info("morning digest: pushed %d match comparisons", n)
+
+
+def _live_odds_poll():
+    """Poll The Odds API for in-play odds and log any edge ≥ 5pp as inplay bets."""
+    try:
+        from data_collection.live_odds_client import run_live_odds_poll
+        result = run_live_odds_poll()
+        if result.get("edges_logged"):
+            log.info("Live odds poll: %d in-play edges logged", result["edges_logged"])
+    except Exception as e:
+        log.error("Live odds poll error: %s", e)
+
+
+def _live_match_poll():
+    """
+    Poll API-Football for all currently in-play fixtures and update LiveMatchState,
+    record events, and write a 1-minute LivePredictionSnapshot per match.
+    Silently no-ops if API_FOOTBALL_KEY is missing.
+    """
+    try:
+        from data_collection.live_match_ingest import run_live_poll
+        result = run_live_poll()
+        if result.get("ok"):
+            n = result.get("live_count", 0)
+            if n:
+                log.info("Live poll: %d in-play, %d snaps, %d events",
+                         n, result.get("snapshots_written", 0), result.get("events_added", 0))
+    except Exception as e:
+        log.error("Live poll error: %s", e)
+
+
+def _send_daily_wc_digest():
+    """
+    Morning Telegram digest of today's WC fixtures with model probabilities.
+    Runs once at 08:00 UTC — silently skipped if Telegram not configured or no WC matches today.
+    """
+    try:
+        from app.config import get_settings
+        s = get_settings()
+        if not s.telegram_bot_token or not s.telegram_chat_id:
+            return
+
+        from app.database import SessionLocal
+        from app.models import Match, Prediction
+        from datetime import datetime, timedelta
+
+        now = datetime.utcnow()
+        end = now + timedelta(hours=24)
+
+        with SessionLocal() as db:
+            todays = (
+                db.query(Match)
+                .filter(
+                    Match.competition.in_(INTL_COMPETITIONS),
+                    Match.status.in_(["SCHEDULED", "TIMED"]),
+                    Match.match_date >= now,
+                    Match.match_date <= end,
+                )
+                .order_by(Match.match_date)
+                .all()
+            )
+            if not todays:
+                return
+
+            pred_lut = {
+                (p.home_team, p.away_team, str(p.match_date)[:10]): p
+                for p in db.query(Prediction)
+                .filter(Prediction.competition.in_(INTL_COMPETITIONS))
+                .all()
+            }
+
+        lines = [f"🌍 *Today's International Matches* ({now.strftime('%Y-%m-%d')})\n"]
+        for m in todays:
+            key = (m.home_team, m.away_team, str(m.match_date)[:10])
+            p = pred_lut.get(key)
+            ko = m.match_date.strftime("%H:%M") if m.match_date else "?"
+            if p:
+                h, d, a = (
+                    f"{(p.home_win_prob or 0)*100:.0f}%",
+                    f"{(p.draw_prob or 0)*100:.0f}%",
+                    f"{(p.away_win_prob or 0)*100:.0f}%",
+                )
+                lines.append(
+                    f"⏰ {ko} UTC | [{m.competition}]\n"
+                    f"⚽ *{m.home_team}* vs *{m.away_team}*\n"
+                    f"H {h} · D {d} · A {a} → *{p.predicted_outcome or '?'}*\n"
+                )
+            else:
+                lines.append(
+                    f"⏰ {ko} UTC | [{m.competition}]\n"
+                    f"⚽ *{m.home_team}* vs *{m.away_team}*\n"
+                    f"_(no prediction yet — hit /predictions {m.competition} to generate)_\n"
+                )
+        _send_telegram("\n".join(lines))
+        log.info("Scheduler: daily WC digest sent (%d matches)", len(todays))
+    except Exception as e:
+        log.error("Scheduler: WC digest error: %s", e)
+
+
+def _send_tournament_preview(n_matches: int = 8):
+    """
+    Send a Telegram message listing the next N upcoming WC/EC matches with
+    model probabilities. Unlike _send_daily_wc_digest, this ignores the 24h
+    window — useful as a manual 'what's coming up' trigger.
+    """
+    try:
+        from app.config import get_settings
+        s = get_settings()
+        if not s.telegram_bot_token or not s.telegram_chat_id:
+            return
+
+        from app.database import SessionLocal
+        from app.models import Match, Prediction
+        from datetime import datetime
+
+        with SessionLocal() as db:
+            upcoming = (
+                db.query(Match)
+                .filter(
+                    Match.competition.in_(INTL_COMPETITIONS),
+                    Match.status.in_(["SCHEDULED", "TIMED"]),
+                    Match.match_date >= datetime.utcnow(),
+                )
+                .order_by(Match.match_date)
+                .limit(n_matches)
+                .all()
+            )
+            if not upcoming:
+                _send_telegram("🌍 *Tournament Preview*\n\nNo upcoming WC/EC matches in the DB.")
+                return
+
+            pred_lut = {
+                (p.home_team, p.away_team, str(p.match_date)[:10]): p
+                for p in db.query(Prediction)
+                .filter(Prediction.competition.in_(INTL_COMPETITIONS))
+                .all()
+            }
+
+        lines = [f"🌍 *Upcoming {len(upcoming)} Matches*\n"]
+        for m in upcoming:
+            key = (m.home_team, m.away_team, str(m.match_date)[:10])
+            p = pred_lut.get(key)
+            ko = m.match_date.strftime("%a %b %d %H:%M") if m.match_date else "?"
+            if p and p.home_win_prob is not None:
+                h = f"{p.home_win_prob*100:.0f}%"
+                d = f"{p.draw_prob*100:.0f}%"
+                a = f"{p.away_win_prob*100:.0f}%"
+                lines.append(
+                    f"📅 {ko} UTC | [{m.competition}]\n"
+                    f"⚽ *{m.home_team}* vs *{m.away_team}*\n"
+                    f"H {h} · D {d} · A {a} → *{p.predicted_outcome or '?'}*\n"
+                )
+            else:
+                lines.append(
+                    f"📅 {ko} UTC | [{m.competition}]\n"
+                    f"⚽ *{m.home_team}* vs *{m.away_team}*\n"
+                    f"_(prediction pending)_\n"
+                )
+        _send_telegram("\n".join(lines))
+        log.info("Scheduler: tournament preview sent (%d matches)", len(upcoming))
+    except Exception as e:
+        log.error("Scheduler: tournament preview error: %s", e)
+
+
+def _fire_telegram_for_new_high_edge_bets():
+    """
+    Per-bet Telegram alert for new high-edge pending bets. Uses the BetLog.tags
+    field as a sentinel — `tg_alerted` flag tracks rows already pushed.
+    Threshold reuses settings.telegram_min_edge.
+    """
+    try:
+        from app.config import get_settings
+        from app.database import SessionLocal
+        from app.models import BetLog
+        s = get_settings()
+        if not s.telegram_bot_token or not s.telegram_chat_id:
+            return
+
+        with SessionLocal() as db:
+            bets = (
+                db.query(BetLog)
+                .filter(
+                    BetLog.won.is_(None),
+                    BetLog.edge_pct >= s.telegram_min_edge,
+                )
+                .all()
+            )
+            new_bets = [b for b in bets if not (b.tags and "tg_alerted" in b.tags)]
+            for bet in new_bets:
+                ko = bet.match_date.strftime("%Y-%m-%d %H:%M") if bet.match_date else "?"
+                _send_telegram(
+                    f"🎯 *High-Edge Bet* [{bet.competition}]\n"
+                    f"⚽ {bet.home_team} vs {bet.away_team}\n"
+                    f"⏰ {ko} UTC\n"
+                    f"🎰 *{bet.bet_on}* @{bet.decimal_odds:.2f}\n"
+                    f"📊 Edge: +{bet.edge_pct}% | Kelly: {bet.kelly_pct}%\n"
+                    f"💡 Model: {round((bet.model_prob or 0)*100, 1)}% vs "
+                    f"Market: {round((bet.implied_prob or 0)*100, 1)}%"
+                )
+                bet.tags = (bet.tags or "") + ("," if bet.tags else "") + "tg_alerted"
+            if new_bets:
+                db.commit()
+                log.info("Scheduler: pushed %d high-edge Telegram alerts", len(new_bets))
+    except Exception as e:
+        log.error("Scheduler: telegram alert error: %s", e)
+
+
+def _send_prematch_telegram_reminders():
+    """
+    30 minutes before kickoff, push a Telegram reminder for WC/EC matches with
+    a stored prediction. Uses Prediction row's resolved_at NULL as 'still pending'.
+    """
+    try:
+        from app.config import get_settings
+        from app.database import SessionLocal
+        from app.models import Match, Prediction
+        from datetime import datetime, timedelta
+        s = get_settings()
+        if not s.telegram_bot_token or not s.telegram_chat_id:
+            return
+
+        now = datetime.utcnow()
+        # Window: matches starting in the next 30–45 minutes (avoids duplicate fires every 15 min)
+        soon_lo = now + timedelta(minutes=30)
+        soon_hi = now + timedelta(minutes=45)
+
+        with SessionLocal() as db:
+            matches = (
+                db.query(Match)
+                .filter(
+                    Match.competition.in_(INTL_COMPETITIONS),
+                    Match.status.in_(["SCHEDULED", "TIMED"]),
+                    Match.match_date >= soon_lo,
+                    Match.match_date <  soon_hi,
+                )
+                .all()
+            )
+            if not matches:
+                return
+            for m in matches:
+                p = (
+                    db.query(Prediction)
+                    .filter(
+                        Prediction.competition == m.competition,
+                        Prediction.home_team == m.home_team,
+                        Prediction.away_team == m.away_team,
+                        Prediction.match_date == m.match_date,
+                    )
+                    .first()
+                )
+                if not p:
+                    continue
+                ko = m.match_date.strftime("%H:%M")
+                h, d, a = (
+                    f"{(p.home_win_prob or 0)*100:.0f}%",
+                    f"{(p.draw_prob or 0)*100:.0f}%",
+                    f"{(p.away_win_prob or 0)*100:.0f}%",
+                )
+                _send_telegram(
+                    f"⏱️ *Kickoff in ~30 min* [{m.competition}]\n"
+                    f"⚽ *{m.home_team}* vs *{m.away_team}*\n"
+                    f"⏰ {ko} UTC\n"
+                    f"H {h} · D {d} · A {a} → *{p.predicted_outcome or '?'}*\n"
+                    f"O2.5: {round((p.over_2_5_prob or 0)*100)}% | BTTS: {round((p.btts_prob or 0)*100)}%"
+                )
+            log.info("Scheduler: pre-match reminders sent for %d matches", len(matches))
+    except Exception as e:
+        log.error("Scheduler: prematch reminder error: %s", e)
+
+
 def create_scheduler() -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone="UTC")
 
@@ -664,6 +1086,18 @@ def create_scheduler() -> AsyncIOScheduler:
         name="Lineup confirmation polling",
         replace_existing=True,
         misfire_grace_time=600,
+    )
+
+    # Daily FRIENDLY + lower-league refresh at 01:30 UTC — runs after the
+    # API-Football quota resets at 00:00 UTC. Pulls overnight results then
+    # fires the morning digest comparing predictions vs actuals.
+    scheduler.add_job(
+        _refresh_daily_friendlies,
+        trigger=CronTrigger(hour=1, minute=30),
+        id="refresh_friendlies",
+        name="Daily FRIENDLY fixture + results refresh",
+        replace_existing=True,
+        misfire_grace_time=3600,
     )
 
     # Refresh injury/availability data daily at 06:00 UTC
@@ -734,6 +1168,61 @@ def create_scheduler() -> AsyncIOScheduler:
         name="Weekly Telegram digest",
         replace_existing=True,
         misfire_grace_time=3600,
+    )
+
+    # Daily WC/EC Telegram digest — 08:00 UTC, day-of fixture list with probabilities
+    scheduler.add_job(
+        _send_daily_wc_digest,
+        trigger=CronTrigger(hour=8, minute=0),
+        id="daily_wc_digest",
+        name="Daily WC Telegram digest",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Per-bet Telegram alert for high-edge picks — every 30 min during matchday hours
+    scheduler.add_job(
+        _fire_telegram_for_new_high_edge_bets,
+        trigger=CronTrigger(hour="10-23", minute="5,35"),
+        id="telegram_high_edge_alerts",
+        name="Telegram high-edge bet alerts",
+        replace_existing=True,
+        misfire_grace_time=600,
+    )
+
+    # In-play odds polling every 3 minutes during matchday hours. The Odds API
+    # free tier is 500 req/month; this consumes ~260/day during heavy WC days
+    # so will exhaust quickly — that's acceptable for the tournament window.
+    scheduler.add_job(
+        _live_odds_poll,
+        trigger=CronTrigger(hour="10-23", minute="*/3"),
+        id="live_odds_poll",
+        name="Live odds + in-play edge detection",
+        replace_existing=True,
+        misfire_grace_time=60,
+    )
+
+    # Live match polling — every minute during matchday hours (10:00–23:00 UTC).
+    # Uses API-Football's /fixtures?live=all endpoint. Free tier quota is tight
+    # (100 req/day) — this consumes ~13 req/hour during the 13-hour window.
+    scheduler.add_job(
+        _live_match_poll,
+        trigger=CronTrigger(hour="10-23", minute="*"),
+        id="live_match_poll",
+        name="Live match state polling",
+        replace_existing=True,
+        misfire_grace_time=60,
+    )
+
+    # Pre-match Telegram reminders — every 15 min during matchday hours
+    # Fires for matches starting in 30–45 min so 15-min cadence catches each match once.
+    scheduler.add_job(
+        _send_prematch_telegram_reminders,
+        trigger=CronTrigger(hour="10-23", minute="*/15"),
+        id="prematch_reminders",
+        name="Pre-match Telegram reminders",
+        replace_existing=True,
+        misfire_grace_time=300,
     )
 
     return scheduler

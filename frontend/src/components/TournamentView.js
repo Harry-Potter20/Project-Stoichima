@@ -5,6 +5,8 @@ import {
 import SpreadSelector from './SpreadSelector';
 import AddToSlipBtn from './AddToSlipBtn';
 import KnockoutBracket from './KnockoutBracket';
+import { flagFor } from './countryFlags';
+import { CardSkeleton } from './LoadingSkeleton';
 
 const API = process.env.REACT_APP_API_URL;
 
@@ -35,6 +37,25 @@ function ConfidenceTag({ confidence }) {
   const label = ag >= 0.8 ? 'High' : ag >= 0.5 ? 'Med' : 'Low';
   const cls   = ag >= 0.8 ? 'text-green-400' : ag >= 0.5 ? 'text-yellow-400' : 'text-red-400';
   return <span className={`text-[10px] font-semibold ${cls}`}>{label} conf.</span>;
+}
+
+function ComponentBreakdown({ components }) {
+  if (!components) return null;
+  const labels = { outcome_model: 'XGB', bilstm: 'BiLSTM', player_form: 'Players' };
+  return (
+    <div className="text-[10px] text-gray-500 mt-0.5 leading-tight">
+      <span className="text-gray-600">Model agreement:</span>{' '}
+      {Object.entries(components).map(([k, v]) => {
+        const top = Math.max(v.H || 0, v.D || 0, v.A || 0);
+        return (
+          <span key={k} className="mr-1.5">
+            <span className="text-gray-500">{labels[k] || k}</span>
+            <span className="text-gray-400"> {Math.round(top * 100)}%</span>
+          </span>
+        );
+      })}
+    </div>
+  );
 }
 
 function ProbBar({ home, draw, away }) {
@@ -81,9 +102,9 @@ function H2HPanel({ homeTeam, awayTeam, onClose }) {
         ) : (
           <div className="p-5 space-y-4">
             <div className="flex justify-between items-center">
-              <span className="font-semibold text-white">{homeTeam}</span>
+              <span className="font-semibold text-white">{flagFor(homeTeam)} {homeTeam}</span>
               <span className="text-gray-500 text-sm">{data.meetings} meetings</span>
-              <span className="font-semibold text-white">{awayTeam}</span>
+              <span className="font-semibold text-white">{awayTeam} {flagFor(awayTeam)}</span>
             </div>
             <div className="grid grid-cols-3 gap-3 text-center text-sm">
               <div className="bg-green-900/40 rounded p-2">
@@ -227,7 +248,18 @@ function GroupStandings({ competitionId, simProbs }) {
     setOverrides(prev => ({ ...prev, [key]: prev[key] === result ? undefined : result }));
   };
 
-  if (loading) return <div className="text-gray-400 text-center py-8">Loading groups…</div>;
+  if (loading) return (
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+      {Array.from({ length: 8 }).map((_, i) => (
+        <div key={i} className="bg-gray-800 rounded-lg p-3 border border-gray-700 animate-pulse">
+          <div className="h-4 bg-gray-700 rounded w-20 mb-3" />
+          {Array.from({ length: 4 }).map((_, j) => (
+            <div key={j} className="h-3 bg-gray-700 rounded w-full mb-2" />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
   if (error)   return <div className="text-red-400 text-center py-8">{error}</div>;
   if (!data)   return null;
 
@@ -338,8 +370,9 @@ function GroupStandings({ competitionId, simProbs }) {
                     const winProb = simProbs?.[t.team]?.winner;
                     return (
                       <tr key={t.team} className={`border-b border-gray-700/50 ${st.row}`}>
-                        <td className="px-2 py-1.5 font-medium max-w-[90px] truncate">
-                          <span className={`mr-1 ${st.cls}`}>{st.dot}</span>{t.team}
+                        <td className="px-2 py-1.5 font-medium max-w-[110px] truncate">
+                          <span className={`mr-1 ${st.cls}`}>{st.dot}</span>
+                          <span className="mr-1">{flagFor(t.team)}</span>{t.team}
                         </td>
                         <td className="px-1 py-1.5 text-center text-gray-400">{t.played}</td>
                         <td className="px-1 py-1.5 text-center text-gray-400">{t.won}</td>
@@ -435,7 +468,7 @@ function TournamentPredictions({ competitionId }) {
 
   const formatDate = d => new Date(d).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
-  if (loading) return <div className="text-gray-400 text-center py-8">Loading predictions…</div>;
+  if (loading) return <CardSkeleton rows={8} />;
   if (error)   return <div className="text-red-400 text-center py-8">{error}</div>;
   if (!preds?.length) return <div className="text-gray-400 text-center py-8">No upcoming matches.</div>;
 
@@ -474,8 +507,10 @@ function TournamentPredictions({ competitionId }) {
             <div key={i} className="bg-gray-800 rounded-lg border border-gray-700 p-3">
               <div className="flex justify-between items-start mb-1">
                 <div>
-                  <button onClick={() => setH2hMatch(p)} className="font-semibold text-white text-sm hover:text-green-400 text-left">{p.home_team}</button>
-                  <div className="text-gray-400 text-xs">vs <button onClick={() => setH2hMatch(p)} className="hover:text-green-400">{p.away_team}</button></div>
+                  <button onClick={() => setH2hMatch(p)} className="font-semibold text-white text-sm hover:text-green-400 text-left">
+                    <span className="mr-1">{flagFor(p.home_team)}</span>{p.home_team}
+                  </button>
+                  <div className="text-gray-400 text-xs">vs <button onClick={() => setH2hMatch(p)} className="hover:text-green-400"><span className="mr-1">{flagFor(p.away_team)}</span>{p.away_team}</button></div>
                   <XgRangeBar xgRange={p.xg_range} />
                 </div>
                 <div className="text-right">
@@ -485,6 +520,7 @@ function TournamentPredictions({ competitionId }) {
                 </div>
               </div>
               <div className="mt-2">{renderTournamentMarket(p, market, subOption)}</div>
+              <ComponentBreakdown components={p.component_probas} />
               <div className="flex gap-1.5 mt-2 flex-wrap">
                 {[{ label: 'H', prob: o.home_win_prob }, { label: 'D', prob: o.draw_prob }, { label: 'A', prob: o.away_win_prob }].map(ol => (
                   <AddToSlipBtn key={ol.label} leg={makeLeg(p, ol.label, '1x2', null, ol.prob)} small />
@@ -535,11 +571,15 @@ function TournamentPredictions({ competitionId }) {
                 <React.Fragment key={i}>
                   <tr className={`border-t border-gray-700 hover:bg-gray-700/50 ${i%2===0 ? 'bg-gray-800' : 'bg-gray-850'}`}>
                     <td className="px-4 py-2 font-medium">
-                      <button onClick={() => setH2hMatch(p)} className="hover:text-green-400 transition-colors text-left">{p.home_team}</button>
+                      <button onClick={() => setH2hMatch(p)} className="hover:text-green-400 transition-colors text-left">
+                        <span className="mr-1.5">{flagFor(p.home_team)}</span>{p.home_team}
+                      </button>
                       <XgRangeBar xgRange={p.xg_range} />
                     </td>
                     <td className="px-4 py-2 text-gray-300">
-                      <button onClick={() => setH2hMatch(p)} className="hover:text-green-400 transition-colors">{p.away_team}</button>
+                      <button onClick={() => setH2hMatch(p)} className="hover:text-green-400 transition-colors">
+                        <span className="mr-1.5">{flagFor(p.away_team)}</span>{p.away_team}
+                      </button>
                     </td>
                     <td className="px-4 py-2 text-gray-400 text-xs">{p.tournament_stage || '—'}</td>
                     <td className="px-4 py-2 text-xs">
@@ -704,6 +744,50 @@ function SimulationResults({ competitionId, onSimComplete }) {
   );
 }
 
+// ─── Kickoff countdown banner ────────────────────────────────────────────────
+
+const KICKOFF_DATES = {
+  WC: new Date('2026-06-11T19:00:00Z'),
+  EC: new Date('2024-06-14T19:00:00Z'),
+};
+
+function CountdownBanner({ competition }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60000);
+    return () => clearInterval(id);
+  }, []);
+
+  const target = KICKOFF_DATES[competition];
+  if (!target) return null;
+  const diffMs = target.getTime() - now;
+  if (diffMs <= 0) {
+    return (
+      <div className="bg-green-900/30 border border-green-700 rounded-lg px-4 py-2.5 mb-3 flex items-center gap-3">
+        <span className="text-2xl">🟢</span>
+        <div className="text-sm">
+          <div className="font-bold text-green-300">Tournament is live</div>
+          <div className="text-green-500 text-xs">Predictions are updating in real time</div>
+        </div>
+      </div>
+    );
+  }
+  const days = Math.floor(diffMs / 86400000);
+  const hours = Math.floor((diffMs % 86400000) / 3600000);
+  const label =
+    competition === 'WC' ? 'FIFA World Cup 2026' :
+    competition === 'EC' ? 'UEFA Euro 2024'      : 'Tournament';
+  return (
+    <div className="bg-gradient-to-r from-blue-900/40 to-purple-900/40 border border-blue-700/50 rounded-lg px-4 py-2.5 mb-3 flex items-center gap-3">
+      <span className="text-2xl">⏱️</span>
+      <div className="text-sm">
+        <div className="font-bold text-blue-200">{label} kicks off in {days}d {hours}h</div>
+        <div className="text-blue-400 text-xs">{target.toUTCString()}</div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Main TournamentView ──────────────────────────────────────────────────────
 
 const VIEW_TABS = [
@@ -722,6 +806,7 @@ export default function TournamentView() {
 
   return (
     <div className="space-y-6">
+      <CountdownBanner competition={competition} />
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div className="flex gap-2">
           {COMPETITIONS.map(c => (
