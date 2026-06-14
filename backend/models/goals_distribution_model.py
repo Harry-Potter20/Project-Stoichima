@@ -16,6 +16,12 @@ from scipy.stats import poisson
 XI = 0.0018  # time-decay constant (half-life ≈ 1 season)
 MAX_GOALS = 8  # matrix dimension: 0..MAX_GOALS inclusive
 
+# How much a 1-sigma Elo edge shifts a team's log goal-rate prior. ~0.20 means a
+# team one std above the field is seeded ≈ +0.20 attack / −0.20 defense in
+# log-space (~22% more goals scored, ~18% fewer conceded) before its own
+# match data pulls it away. Only used when Elo priors are passed to fit().
+ELO_PRIOR_ALPHA = 0.20
+
 
 def _dc_correction(home_goals: int, away_goals: int, lambda_h: float, lambda_a: float, rho: float) -> float:
     """Dixon-Coles correction for low-scoring cells."""
@@ -37,15 +43,23 @@ class GoalsDistributionModel:
         self.home_advantage: float = 0.0
         self.rho: float = 0.0  # Dixon-Coles low-score correction
         self.teams: list[str] = []
+        self.elo_prior_used: bool = False  # set True when fit() seeds priors from Elo
 
     # ------------------------------------------------------------------
     # Fitting
     # ------------------------------------------------------------------
 
-    def fit(self, df: pd.DataFrame):
+    def fit(self, df: pd.DataFrame, elo_priors: dict[str, float] | None = None):
         """
         df must have columns: home_team, away_team, home_team_score,
         away_team_score, match_date. Only FINISHED rows (non-null scores).
+
+        elo_priors: optional {team: elo_rating}. When supplied, low-data teams
+        are shrunk toward their Elo-implied strength instead of the flat league
+        mean. This is the key fix for international football, where a national
+        team may have only 3-5 matches and its raw MLE attack/defense params are
+        essentially noise — Elo carries the cross-team strength signal that the
+        sparse match data cannot.
         """
         df = df.dropna(subset=["home_team_score", "away_team_score"]).copy()
         df["match_date"] = pd.to_datetime(df["match_date"])
@@ -175,8 +189,26 @@ class GoalsDistributionModel:
         league_attack  = float(np.average(attack_full, weights=team_match_counts))
         league_defense = float(np.average(defense,     weights=team_match_counts))
         w = team_match_counts / (team_match_counts + k)
-        attack_shrunk  = w * attack_full + (1 - w) * league_attack
-        defense_shrunk = w * defense     + (1 - w) * league_defense
+
+        # Per-team shrinkage target. Default: flat league mean. With Elo priors:
+        # pull each team toward its Elo-implied strength (z-scored across the
+        # field), so a 3-match minnow lands near its true level instead of the
+        # average. A team's own data still dominates once it has many matches.
+        prior_attack  = np.full(n, league_attack)
+        prior_defense = np.full(n, league_defense)
+        if elo_priors:
+            elos = np.array([elo_priors.get(t, np.nan) for t in self.teams], dtype=float)
+            mask = ~np.isnan(elos)
+            if mask.sum() >= 2:
+                mu    = float(np.average(elos[mask], weights=team_match_counts[mask]))
+                sigma = float(np.std(elos[mask])) or 1.0
+                z = np.where(mask, (elos - mu) / sigma, 0.0)
+                prior_attack  = league_attack  + ELO_PRIOR_ALPHA * z
+                prior_defense = league_defense - ELO_PRIOR_ALPHA * z
+                self.elo_prior_used = True
+
+        attack_shrunk  = w * attack_full + (1 - w) * prior_attack
+        defense_shrunk = w * defense     + (1 - w) * prior_defense
 
         self.attack         = {t: float(attack_shrunk[i])  for t, i in team_idx.items()}
         self.defense        = {t: float(defense_shrunk[i]) for t, i in team_idx.items()}

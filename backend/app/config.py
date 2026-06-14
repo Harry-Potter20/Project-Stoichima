@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
 
@@ -92,9 +92,28 @@ class Settings(BaseSettings):
     # ELO mean-reversion for international teams
     intl_elo_reversion_rate: float = 0.05   # fraction toward 1500 per inactive month
 
-    class Config:
-        env_file = ".env"
-        protected_namespaces = ()   # allow model_* field names
+    # ── Prediction tuning ────────────────────────────────────────────────────
+    # Market anchoring: share of the 1X2 probability taken from the bookmaker
+    # closing line (0 = pure model, 1 = pure market). The closing line is very
+    # well calibrated; the league outcome model currently has NEGATIVE skill on
+    # a clean PL holdout (model Brier 0.82 vs market 0.59, optimal weight 1.0 —
+    # see validation/holdout.py), so we anchor hard to the market while keeping
+    # a small model tilt. NO-OP where odds are absent (e.g. international/WC),
+    # so this does not touch the tournament predictions. Lower toward 0 once the
+    # outcome model is retrained with closing-odds features and beats the line.
+    market_blend_weight: float = 0.7
+    # Only call a Draw when its probability clears this floor AND beats both
+    # sides — stops low-value argmax draw picks that tank accuracy.
+    draw_pick_floor: float = 0.40
+
+    # Admin API protection — when set, /admin/* endpoints require this value
+    # in the X-Admin-Key header. Leave blank to keep them open (local dev).
+    admin_api_key: str = ""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        protected_namespaces=(),   # allow model_* field names
+    )
 
 
 @lru_cache()

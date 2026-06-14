@@ -63,6 +63,13 @@ def _matches_to_df(matches, include_result: bool = True) -> pd.DataFrame:
             "opening_home_odds":    getattr(m, "opening_home_odds", None),
             "opening_draw_odds":    getattr(m, "opening_draw_odds", None),
             "opening_away_odds":    getattr(m, "opening_away_odds", None),
+            # Closing/market odds for the optional market-anchor blend
+            "avg_home":             getattr(m, "avg_home", None),
+            "avg_draw":             getattr(m, "avg_draw", None),
+            "avg_away":             getattr(m, "avg_away", None),
+            "b365_home":            getattr(m, "b365_home", None),
+            "b365_draw":            getattr(m, "b365_draw", None),
+            "b365_away":            getattr(m, "b365_away", None),
             "is_neutral_venue":     bool(getattr(m, "is_neutral_venue", False) or False),
             "competition":          getattr(m, "competition", None),
         }

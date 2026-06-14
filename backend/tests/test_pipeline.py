@@ -255,6 +255,14 @@ def test_model_info_endpoint(client):
     assert "brier_baseline" in body
 
 
+def test_admin_auth_enforced_when_key_set(client, monkeypatch):
+    import app.main as main
+    monkeypatch.setattr(main.settings, "admin_api_key", "s3cret")
+    assert client.get("/admin/model-info").status_code == 401
+    assert client.get("/admin/model-info", headers={"X-Admin-Key": "wrong"}).status_code == 401
+    assert client.get("/admin/model-info", headers={"X-Admin-Key": "s3cret"}).status_code == 200
+
+
 def test_draw_specialist_feature():
     from data_processing.feature_engineering import _add_form_and_goals_features
     df = _sample_df(15)

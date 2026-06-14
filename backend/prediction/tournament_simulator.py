@@ -323,7 +323,9 @@ class MonteCarloSimulator:
     # ------------------------------------------------------------------
 
     def _simulate_knockout(self, bracket: list[tuple], counts: dict) -> None:
-        # r32…final are "advanced from this round" counts; winner is the champion
+        # r32…final count teams that REACH each round (both participants of
+        # every match in that round); winner is the champion. This matches the
+        # API docstring and the frontend column labels (R32/R16/QF/SF/Final/Win).
         stage_labels = ["r32", "r16", "qf", "sf", "final"]
         current_round = bracket
         last_winners: list[str] = []
@@ -333,9 +335,9 @@ class MonteCarloSimulator:
                 break
             last_winners = []
             for home, away in current_round:
-                winner = self._sample_knockout_winner(home, away)
-                counts[winner][stage] += 1
-                last_winners.append(winner)
+                counts[home][stage] += 1
+                counts[away][stage] += 1
+                last_winners.append(self._sample_knockout_winner(home, away))
             current_round = [
                 (last_winners[i], last_winners[i + 1])
                 for i in range(0, len(last_winners) - 1, 2)

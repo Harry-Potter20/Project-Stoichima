@@ -11,6 +11,7 @@ import TennisView from './components/TennisView';
 import BasketballView from './components/BasketballView';
 import BetBuilder from './components/BetBuilder';
 import KellyCalculator from './components/KellyCalculator';
+import ScoringPanel from './components/ScoringPanel';
 import { BetSlipProvider } from './context/BetSlipContext';
 
 const TOP_LEAGUES = [
@@ -53,6 +54,7 @@ const TABS = [
 
 const EDGE_TABS = [
   { id: 'bot',      label: '🤖 Betting Bot' },
+  { id: 'scoring',  label: '📈 Model vs Market' },
   { id: 'clv',      label: 'Closing Line Value' },
   { id: 'bankroll', label: 'Bankroll Simulator' },
   { id: 'kelly',    label: '🧮 Kelly Calculator' },
@@ -66,30 +68,40 @@ function App() {
 
   return (
     <BetSlipProvider>
-    <div className="min-h-screen bg-gray-900 text-white">
-      <nav className="bg-gray-800 border-b border-gray-700 px-4 md:px-6 py-3 md:py-4">
-        <div className="flex items-center justify-between gap-2">
-          <h1 className="text-xl md:text-2xl font-bold text-green-400 shrink-0">⚽ Stoichima</h1>
+    <div className="min-h-screen text-white">
+      <nav className="glass sticky top-0 z-50 px-4 md:px-6 py-3 md:py-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 shrink-0 animate-rise">
+            <img src="/logo.svg" alt="Stoichima" className="w-9 h-9 md:w-11 md:h-11 animate-logo" />
+            <div className="leading-none">
+              <div className="wordmark text-lg md:text-2xl">STOICHIMA</div>
+              <div className="hidden md:block font-display text-[10px] text-teal-300/70 mt-1">
+                PROBABILISTIC FOOTBALL INTELLIGENCE
+              </div>
+            </div>
+          </div>
           {/* Desktop tabs */}
-          <div className="hidden md:flex gap-1 flex-wrap justify-end">
+          <div className="hidden md:flex gap-1 flex-wrap justify-end animate-rise-2">
             {TABS.map(t => (
               <button
                 key={t.id}
                 onClick={() => setTab(t.id)}
-                className={`px-3 py-1.5 rounded font-semibold text-sm transition-colors ${
-                  tab === t.id ? 'bg-green-500 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                className={`sweep px-3 py-1.5 rounded-lg font-semibold text-sm transition-all ${
+                  tab === t.id
+                    ? 'tab-active glass-soft text-white'
+                    : 'text-gray-400 hover:text-teal-200 hover:bg-white/5'
                 }`}
               >{t.label}</button>
             ))}
           </div>
           {/* Mobile: scrollable tab strip */}
-          <div className="flex md:hidden gap-1 overflow-x-auto pb-0.5 max-w-[calc(100vw-120px)]">
+          <div className="flex md:hidden gap-1 overflow-x-auto neon-scroll pb-0.5 max-w-[calc(100vw-130px)]">
             {TABS.map(t => (
               <button
                 key={t.id}
                 onClick={() => setTab(t.id)}
-                className={`px-2.5 py-1 rounded text-xs font-semibold whitespace-nowrap transition-colors ${
-                  tab === t.id ? 'bg-green-500 text-white' : 'bg-gray-700 text-gray-300'
+                className={`px-2.5 py-1 rounded-lg text-xs font-semibold whitespace-nowrap transition-colors ${
+                  tab === t.id ? 'glass-soft tab-active text-white' : 'text-gray-400'
                 }`}
               >{t.label}</button>
             ))}
@@ -107,7 +119,7 @@ function App() {
       {/* ── Predictions tab ─────────────────────────────────────────────── */}
       {tab === 'predictions' && (
         <>
-          <div className="bg-gray-800 border-b border-gray-700 px-6 py-3">
+          <div className="glass-soft px-6 py-3">
             <div className="flex gap-2 flex-wrap items-center">
               {TOP_LEAGUES.map(({ id, label }) => (
                 <button
@@ -179,7 +191,7 @@ function App() {
       {/* ── Edge / CLV tab ──────────────────────────────────────────────── */}
       {tab === 'edge' && (
         <>
-          <div className="bg-gray-800 border-b border-gray-700 px-6 py-3 flex gap-2">
+          <div className="glass-soft px-6 py-3 flex gap-2 flex-wrap">
             {EDGE_TABS.map(t => (
               <button
                 key={t.id}
@@ -196,6 +208,7 @@ function App() {
           </div>
           <main className="max-w-6xl mx-auto px-6 py-8">
             {edgeTab === 'bot'      && <BettingBot />}
+            {edgeTab === 'scoring'  && <ScoringPanel />}
             {edgeTab === 'clv'      && <CLVChart />}
             {edgeTab === 'bankroll' && <BankrollChart />}
             {edgeTab === 'kelly'    && <KellyCalculator />}

@@ -193,19 +193,40 @@ def train_goals_distribution_intl(raw_df: pd.DataFrame):
     intl_df = intl_df.copy()
     intl_df["is_neutral_venue"] = 1   # international fixtures are neutral
 
+    # Load international Elo ratings (competition IS NULL) to seed the per-team
+    # priors. With only ~700 international matches spread over 100+ nations,
+    # many teams have <5 games; Elo carries the strength signal their match
+    # data can't. Falls back to flat-mean shrinkage if no Elo is available.
+    elo_priors = _load_international_elo()
+    if elo_priors:
+        print(f"  using Elo priors for {len(elo_priors)} national teams")
+
     with model_run("goals_distribution_intl", tags={"model_type": "dixon_coles_intl"}):
         log_dataset_info(intl_df)
         model = GoalsDistributionModel()
-        model.fit(intl_df)
+        model.fit(intl_df, elo_priors=elo_priors)
         model.save("saved_models/goals_distribution_intl.pkl")
         mlflow.log_params({
             "n_matches":      len(intl_df),
             "n_teams":        len(model.teams),
             "home_advantage": round(model.home_advantage, 4),
             "rho":            round(model.rho, 4),
+            "elo_prior_used": model.elo_prior_used,
         })
-    print(f"  ✓ saved_models/goals_distribution_intl.pkl ({len(model.teams)} teams)")
+    print(f"  ✓ saved_models/goals_distribution_intl.pkl ({len(model.teams)} teams, "
+          f"elo_prior={'on' if model.elo_prior_used else 'off'})")
     return model
+
+
+def _load_international_elo() -> dict[str, float]:
+    """{team: elo} for national teams (EloRating.competition IS NULL)."""
+    from app.models import EloRating
+    db = SessionLocal()
+    try:
+        rows = db.query(EloRating).filter(EloRating.competition.is_(None)).all()
+        return {r.team: float(r.elo) for r in rows if r.elo is not None}
+    finally:
+        db.close()
 
 
 def train_match_outcome(df: pd.DataFrame):

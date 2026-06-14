@@ -1,3 +1,116 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+:root {
+  --glass-bg: rgba(17, 24, 27, 0.55);
+  --glass-border: rgba(16, 185, 129, 0.18);
+  --neon: #2dd4bf;
+}
+
+body {
+  font-family: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+  background: #060d0b;
+  /* Ambient aurora glows behind the frosted UI */
+  background-image:
+    radial-gradient(60rem 60rem at 12% -10%, rgba(16, 185, 129, 0.18), transparent 60%),
+    radial-gradient(50rem 50rem at 110% 10%, rgba(45, 212, 191, 0.14), transparent 55%),
+    radial-gradient(70rem 40rem at 50% 120%, rgba(5, 150, 105, 0.12), transparent 60%);
+  background-attachment: fixed;
+}
+
+/* ── Glassmorphism ─────────────────────────────────────────────── */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid var(--glass-border);
+  box-shadow:
+    0 8px 32px rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.glass-soft {
+  background: rgba(17, 24, 27, 0.4);
+  backdrop-filter: blur(10px) saturate(130%);
+  -webkit-backdrop-filter: blur(10px) saturate(130%);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+/* ── Futuristic type ───────────────────────────────────────────── */
+.font-display {
+  font-family: 'Orbitron', 'Space Grotesk', sans-serif;
+  letter-spacing: 0.18em;
+}
+
+.wordmark {
+  font-family: 'Orbitron', sans-serif;
+  font-weight: 900;
+  letter-spacing: 0.22em;
+  background: linear-gradient(100deg, #ecfdf5 0%, #2dd4bf 40%, #10b981 60%, #ecfdf5 100%);
+  background-size: 220% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 6s linear infinite;
+}
+
+/* ── Animations ────────────────────────────────────────────────── */
+@keyframes shimmer {
+  to { background-position: 220% center; }
+}
+@keyframes float-pulse {
+  0%, 100% { transform: translateY(0); filter: drop-shadow(0 0 6px rgba(45, 212, 191, 0.45)); }
+  50%      { transform: translateY(-3px); filter: drop-shadow(0 0 16px rgba(45, 212, 191, 0.85)); }
+}
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes sweep {
+  0%   { transform: translateX(-120%); }
+  100% { transform: translateX(220%); }
+}
+
+.animate-logo { animation: float-pulse 4.5s ease-in-out infinite; }
+.animate-rise { animation: rise-in 0.6s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.animate-rise-2 { animation: rise-in 0.6s cubic-bezier(0.22, 1, 0.36, 1) 0.12s both; }
+.animate-rise-3 { animation: rise-in 0.6s cubic-bezier(0.22, 1, 0.36, 1) 0.24s both; }
+
+/* Neon tab underline + hover sweep */
+.tab-active {
+  position: relative;
+  color: #fff;
+}
+.tab-active::after {
+  content: '';
+  position: absolute;
+  left: 12%;
+  right: 12%;
+  bottom: -6px;
+  height: 2px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--neon), transparent);
+  box-shadow: 0 0 10px var(--neon);
+}
+
+.sweep {
+  position: relative;
+  overflow: hidden;
+}
+.sweep::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  transform: translateX(-120%);
+}
+.sweep:hover::before { animation: sweep 0.9s ease; }
+
+@media (prefers-reduced-motion: reduce) {
+  .wordmark, .animate-logo, .animate-rise, .animate-rise-2, .animate-rise-3 { animation: none; }
+}
+
+/* Thin neon scrollbar for the tab strip */
+.neon-scroll::-webkit-scrollbar { height: 4px; }
+.neon-scroll::-webkit-scrollbar-thumb { background: rgba(45, 212, 191, 0.4); border-radius: 4px; }

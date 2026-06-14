@@ -27,6 +27,67 @@ from models.ensemble_model import EnsembleModel
 from models.xg_model import XGModel
 
 
+def _pick_outcome(h: float, d: float, a: float, draw_floor: float = 0.40) -> str:
+    """
+    Outcome pick that doesn't naively argmax draws.
+
+    Draws are rarely the modal result with high probability, so a calibrated
+    distribution that leans slightly toward D still loses most of the time when
+    you bet it. Only call a draw when it genuinely dominates (>= draw_floor and
+    above both sides); otherwise take the stronger of H/A. This changes only the
+    headline pick, never the probabilities shown to the user.
+    """
+    if d >= draw_floor and d > h and d > a:
+        return "D"
+    return "H" if h >= a else "A"
+
+
+def _market_implied_from_row(row) -> list[float] | None:
+    """
+    De-vigged [P(H), P(D), P(A)] from whatever closing/market odds the row
+    carries — average market, then Bet365, then opening as last resort.
+    Returns None when no usable odds are present (the common case for genuine
+    upcoming fixtures, in which the caller simply keeps the model's numbers).
+    """
+    for h_key, d_key, a_key in (
+        ("avg_home", "avg_draw", "avg_away"),
+        ("b365_home", "b365_draw", "b365_away"),
+        ("opening_home_odds", "opening_draw_odds", "opening_away_odds"),
+    ):
+        oh, od, oa = row.get(h_key), row.get(d_key), row.get(a_key)
+        try:
+            oh, od, oa = float(oh), float(od), float(oa)
+        except (TypeError, ValueError):
+            continue
+        if min(oh, od, oa) <= 1.0:
+            continue
+        raw = [1.0 / oh, 1.0 / od, 1.0 / oa]
+        s = sum(raw)
+        if s > 0:
+            return [r / s for r in raw]
+    return None
+
+
+def _blend_with_market(h: float, d: float, a: float, row, weight: float):
+    """
+    Anchor model probabilities to the bookmaker line: weight is the share given
+    to the market (0 = pure model, 1 = pure market). The closing line is
+    extremely well-calibrated, so even a modest weight stops the model from
+    doing worse than the market on 1X2. No-op when weight<=0 or odds absent.
+    """
+    if weight <= 0:
+        return h, d, a
+    market = _market_implied_from_row(row)
+    if market is None:
+        return h, d, a
+    w = min(max(weight, 0.0), 1.0)
+    bh = (1 - w) * h + w * market[0]
+    bd = (1 - w) * d + w * market[1]
+    ba = (1 - w) * a + w * market[2]
+    tot = bh + bd + ba
+    return (bh / tot, bd / tot, ba / tot) if tot > 0 else (h, d, a)
+
+
 def _rotation_penalty_for_match(db, home: str, away: str, match_date) -> float:
     """
     If we have a ConfirmedLineup for either side, compare the starting XI's
@@ -315,6 +376,15 @@ class Predictor:
             )
             team_counts = dict(counts)
 
+        # Prediction tuning knobs (market anchoring + draw-pick floor)
+        try:
+            from app.config import get_settings as _gs
+            _s = _gs()
+            _blend_w   = float(getattr(_s, "market_blend_weight", 0.0))
+            _draw_floor = float(getattr(_s, "draw_pick_floor", 0.40))
+        except Exception:
+            _blend_w, _draw_floor = 0.0, 0.40
+
         results = []
         for i, (_, row) in enumerate(upcoming_feat.iterrows()):
             home = row["home_team"]
@@ -323,7 +393,10 @@ class Predictor:
             h_prob = round(float(ensemble_proba[i][0]), 4)
             d_prob = round(float(ensemble_proba[i][1]), 4)
             a_prob = round(float(ensemble_proba[i][2]), 4)
-            predicted_outcome = ["H", "D", "A"][int(np.argmax([h_prob, d_prob, a_prob]))]
+            # Anchor to the closing line where odds exist (no-op otherwise)
+            h_prob, d_prob, a_prob = _blend_with_market(h_prob, d_prob, a_prob, row, _blend_w)
+            h_prob, d_prob, a_prob = round(h_prob, 4), round(d_prob, 4), round(a_prob, 4)
+            predicted_outcome = _pick_outcome(h_prob, d_prob, a_prob, _draw_floor)
 
             over25_prob = round(float(goals_proba[i][1]), 4)
 
@@ -424,7 +497,11 @@ class Predictor:
                                 h_prob = round(h_prob / total, 4)
                                 d_prob = round(d_prob / total, 4)
                                 a_prob = round(a_prob / total, 4)
-                            predicted_outcome = ["H", "D", "A"][int(np.argmax([h_prob, d_prob, a_prob]))]
+                            # Optional market anchor (no-op when weight 0 / no odds)
+                            h_prob, d_prob, a_prob = _blend_with_market(
+                                h_prob, d_prob, a_prob, row, _blend_w)
+                            h_prob, d_prob, a_prob = round(h_prob, 4), round(d_prob, 4), round(a_prob, 4)
+                            predicted_outcome = _pick_outcome(h_prob, d_prob, a_prob, _draw_floor)
                 except Exception:
                     markets = {}
 

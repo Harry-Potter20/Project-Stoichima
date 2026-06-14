@@ -874,6 +874,140 @@ def _send_daily_wc_digest():
         log.error("Scheduler: WC digest error: %s", e)
 
 
+def _format_full_markets(p: dict) -> str:
+    """Compact multi-market block for one fixture (1x2 + goals + BTTS + DC + top CS)."""
+    o = p.get("outcome", {}) or {}
+    m = p.get("markets", {}) or {}
+    xg = p.get("xg_range", {}) or {}
+
+    h = (o.get("home_win_prob") or 0) * 100
+    d = (o.get("draw_prob") or 0) * 100
+    a = (o.get("away_win_prob") or 0) * 100
+    ko = (p.get("match_date") or "")[:16].replace("T", " ")[11:] or "?"
+    comp = p.get("competition", "")
+
+    lines = [
+        f"⚽ *{p['home_team']}* vs *{p['away_team']}*",
+        f"⏰ {ko} UTC · [{comp}]",
+        f"*1X2* → H {h:.0f}% · D {d:.0f}% · A {a:.0f}%  (pick *{o.get('predicted','?')}*)",
+        f"*xG* {xg.get('home_xg',0):.2f} – {xg.get('away_xg',0):.2f}  (tot {xg.get('total_xg',0):.2f})",
+    ]
+
+    ou = (m.get("over_under") or {}).get("2.5")
+    if ou:
+        lines.append(f"*O/U 2.5* → O {ou.get('over',0)*100:.0f}% / U {ou.get('under',0)*100:.0f}%")
+    btts = m.get("btts")
+    if btts:
+        lines.append(f"*BTTS* → Yes {btts.get('yes',0)*100:.0f}% / No {btts.get('no',0)*100:.0f}%")
+    dc = m.get("double_chance")
+    if dc:
+        lines.append(f"*DC* → 1X {dc.get('1X',0)*100:.0f}% · X2 {dc.get('X2',0)*100:.0f}% · 12 {dc.get('12',0)*100:.0f}%")
+    cs = m.get("correct_score") or []
+    if cs:
+        top = " · ".join(f"{s['home_goals']}-{s['away_goals']} {s['probability']*100:.0f}%" for s in cs[:3])
+        lines.append(f"*Top scores* → {top}")
+    return "\n".join(lines)
+
+
+def _send_daily_market_digest(hours: int = 24):
+    """
+    Morning Telegram digest of today's fixtures with FULL prediction markets
+    (1x2, O/U, BTTS, double chance, correct score) — not just H/D/A.
+    Runs the live predictor per fixture so markets are fresh. One message per
+    match to stay under Telegram's 4096-char limit.
+    """
+    try:
+        from app.config import get_settings
+        s = get_settings()
+        if not s.telegram_bot_token or not s.telegram_chat_id:
+            log.info("Scheduler: market digest skipped — Telegram not configured")
+            return {"sent": 0, "reason": "telegram_not_configured"}
+
+        from app.database import SessionLocal
+        from app.models import Match
+        from prediction.predictor import get_predictor
+        from datetime import datetime, timedelta
+        import pandas as pd
+
+        now = datetime.utcnow()
+        end = now + timedelta(hours=hours)
+
+        with SessionLocal() as db:
+            todays = (
+                db.query(Match)
+                .filter(
+                    Match.status.in_(["SCHEDULED", "TIMED"]),
+                    Match.match_date >= now,
+                    Match.match_date <= end,
+                )
+                .order_by(Match.match_date)
+                .all()
+            )
+            if not todays:
+                _send_telegram("📊 *Today's Markets*\n\nNo fixtures scheduled in the next "
+                               f"{hours}h.")
+                return {"sent": 0, "matches": 0}
+
+            predictor = get_predictor()
+
+            def _cols(m, with_result):
+                return {
+                    "home_team": m.home_team, "away_team": m.away_team,
+                    "match_date": m.match_date, "season": m.season, "status": m.status,
+                    "result": (m.result if with_result else None),
+                    "home_team_score": m.home_team_score if with_result else None,
+                    "away_team_score": m.away_team_score if with_result else None,
+                    "home_team_xG": m.home_team_xG if with_result else None,
+                    "away_team_xG": m.away_team_xG if with_result else None,
+                    "over_2_5_goals": m.over_2_5_goals if with_result else None,
+                    "btts": m.btts if with_result else None,
+                    "referee": None,
+                    "home_team_yellow_cards": None, "away_team_yellow_cards": None,
+                    "home_team_red_cards": None, "away_team_red_cards": None,
+                    "opening_home_odds": None, "opening_draw_odds": None, "opening_away_odds": None,
+                    "is_neutral_venue": bool(m.is_neutral_venue or False),
+                    "competition": m.competition,
+                }
+
+            # Pre-load finished matches per competition once (reused across fixtures)
+            finished_by_comp: dict[str, pd.DataFrame] = {}
+            blocks: list[str] = []
+            for match in todays:
+                comp = match.competition
+                if comp not in finished_by_comp:
+                    fin = (
+                        db.query(Match)
+                        .filter(Match.competition == comp, Match.status == "FINISHED")
+                        .order_by(Match.match_date)
+                        .all()
+                    )
+                    finished_by_comp[comp] = (
+                        pd.DataFrame([_cols(m, True) for m in fin]) if fin else pd.DataFrame()
+                    )
+                udf = pd.DataFrame([_cols(match, False)])
+                try:
+                    preds = predictor.predict(udf, finished_by_comp[comp], db=db, competition=comp)
+                    if preds:
+                        blocks.append(_format_full_markets(preds[0]))
+                except Exception as exc:
+                    log.warning("market digest: predict failed for %s vs %s: %s",
+                                match.home_team, match.away_team, exc)
+
+        if not blocks:
+            _send_telegram("📊 *Today's Markets*\n\nNo predictions could be generated.")
+            return {"sent": 0, "matches": len(todays)}
+
+        header = f"📊 *Today's Prediction Markets* — {now.strftime('%a %b %d')} ({len(blocks)} matches)"
+        _send_telegram(header)
+        for block in blocks:
+            _send_telegram(block)
+        log.info("Scheduler: market digest sent (%d matches)", len(blocks))
+        return {"sent": len(blocks), "matches": len(todays)}
+    except Exception as e:
+        log.error("Scheduler: market digest error: %s", e)
+        return {"sent": 0, "error": str(e)}
+
+
 def _send_tournament_preview(n_matches: int = 8):
     """
     Send a Telegram message listing the next N upcoming WC/EC matches with
@@ -1176,6 +1310,16 @@ def create_scheduler() -> AsyncIOScheduler:
         trigger=CronTrigger(hour=8, minute=0),
         id="daily_wc_digest",
         name="Daily WC Telegram digest",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    # Daily full-market digest — today's fixtures with all markets (not just H/D/A)
+    scheduler.add_job(
+        _send_daily_market_digest,
+        trigger=CronTrigger(hour=8, minute=15),
+        id="daily_market_digest",
+        name="Daily full-market Telegram digest",
         replace_existing=True,
         misfire_grace_time=3600,
     )

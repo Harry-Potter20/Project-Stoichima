@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
 import { useBetSlip } from '../context/BetSlipContext';
 
-const API = 'http://localhost:8000/api/v1';
+const API = `${process.env.REACT_APP_API_URL || 'http://localhost:8000'}/api/v1`;
 
 // Bookmakers typically add ~8% additional margin on acca bets vs singles
 const ACCA_BOOK_MARGIN = 0.92;

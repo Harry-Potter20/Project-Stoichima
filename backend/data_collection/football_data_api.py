@@ -17,7 +17,7 @@ HEADERS = {
 
 def _get(endpoint: str) -> dict:
     url = f"{BASE_URL}{endpoint}"
-    response = requests.get(url, headers=HEADERS)
+    response = requests.get(url, headers=HEADERS, timeout=15)
     print(f"Status: {response.status_code}")
     print(f"Response: {response.text[:300]}")  # first 300 chars
     response.raise_for_status()

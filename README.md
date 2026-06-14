@@ -105,6 +105,7 @@ Copy `.env.example` to `.env` and fill in:
 API_FOOTBALL_KEY=your_key   # optional — injury/suspension data
 TELEGRAM_BOT_TOKEN=         # optional — digest alerts
 TELEGRAM_CHAT_ID=
+ADMIN_API_KEY=              # optional — when set, /admin/* requires X-Admin-Key header
 ```
 
 Start the server:

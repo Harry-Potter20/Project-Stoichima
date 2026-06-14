@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 import logging
 import json
 import time
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
 from app.config import get_settings
 
 
@@ -39,6 +39,7 @@ from api.routes.telegram import router as telegram_router
 from api.routes.live import router as live_router
 from api.routes.player_props import router as player_props_router
 from api.routes.bet_builder_v2 import router as parlay_v2_router
+from api.routes.scoring import router as scoring_router
 from fastapi.middleware.cors import CORSMiddleware
 from scheduler import create_scheduler
 
@@ -208,6 +209,7 @@ app.include_router(telegram_router,    tags=["telegram"])
 app.include_router(live_router,        prefix="/api/v1", tags=["live"])
 app.include_router(player_props_router, prefix="/api/v1", tags=["player_props"])
 app.include_router(parlay_v2_router,    prefix="/api/v1", tags=["parlay_v2"])
+app.include_router(scoring_router,      prefix="/api/v1", tags=["scoring"])
 
 @app.get("/")
 def root():
@@ -223,7 +225,18 @@ def health():
     return {"status": "healthy"}
 
 
-@app.post("/admin/backup", tags=["admin"])
+def _require_admin(x_admin_key: str | None = Header(default=None)):
+    """Guard /admin routes. Open when ADMIN_API_KEY is unset (local dev);
+    when set, requests must send it in the X-Admin-Key header."""
+    expected = settings.admin_api_key
+    if expected and x_admin_key != expected:
+        raise HTTPException(status_code=401, detail="invalid or missing X-Admin-Key header")
+
+
+admin = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(_require_admin)])
+
+
+@admin.post("/backup")
 def manual_backup(tag: str = "manual"):
     """Create a timestamped DB backup. Returns path + total backup count."""
     from utils.db_backup import backup_db, list_backups
@@ -231,14 +244,14 @@ def manual_backup(tag: str = "manual"):
     return {"backup_path": path, "total_backups": len(list_backups())}
 
 
-@app.get("/admin/backups", tags=["admin"])
+@admin.get("/backups")
 def list_db_backups():
     """List existing DB backups, newest first."""
     from utils.db_backup import list_backups
     return {"backups": list_backups()}
 
 
-@app.post("/admin/refresh-friendlies", tags=["admin"])
+@admin.post("/refresh-friendlies")
 def manual_refresh_friendlies():
     """Manually trigger the FRIENDLY/MAR/BSA refresh + resolution + morning digest."""
     from scheduler import _refresh_daily_friendlies
@@ -246,14 +259,14 @@ def manual_refresh_friendlies():
     return {"status": "friendly refresh triggered (check logs + Telegram)"}
 
 
-@app.post("/admin/live-poll", tags=["admin"])
+@admin.post("/live-poll")
 def manual_live_poll():
     """Trigger an immediate live-match poll (test the per-minute job)."""
     from data_collection.live_match_ingest import run_live_poll
     return run_live_poll()
 
 
-@app.post("/admin/wc-digest", tags=["admin"])
+@admin.post("/wc-digest")
 def manual_wc_digest():
     """Manually trigger today's WC Telegram digest (test the daily 08:00 UTC job)."""
     from scheduler import _send_daily_wc_digest
@@ -261,7 +274,17 @@ def manual_wc_digest():
     return {"status": "wc digest fired (check Telegram)"}
 
 
-@app.post("/admin/wc-preview", tags=["admin"])
+@admin.post("/market-digest")
+def manual_market_digest(hours: int = 24):
+    """
+    Send today's fixtures to Telegram with FULL prediction markets
+    (1x2, O/U, BTTS, double chance, correct score) — not just H/D/A.
+    """
+    from scheduler import _send_daily_market_digest
+    return _send_daily_market_digest(hours=hours)
+
+
+@admin.post("/wc-preview")
 def manual_wc_preview(n: int = 8):
     """
     Send a Telegram preview of the next N upcoming WC/EC matches with
@@ -273,7 +296,7 @@ def manual_wc_preview(n: int = 8):
     return {"status": f"preview fired for next {n} matches"}
 
 
-@app.post("/admin/prematch-alerts", tags=["admin"])
+@admin.post("/prematch-alerts")
 def manual_prematch_alerts():
     """Manually trigger pre-match alerts (matches starting in 30–45 min)."""
     from scheduler import _send_prematch_telegram_reminders
@@ -281,7 +304,7 @@ def manual_prematch_alerts():
     return {"status": "prematch alerts fired"}
 
 
-@app.post("/admin/refresh", tags=["admin"])
+@admin.post("/refresh")
 def manual_refresh():
     """Trigger an immediate fixture refresh + prediction resolution outside the schedule."""
     from scheduler import _refresh_fixtures, _resolve_predictions
@@ -290,7 +313,7 @@ def manual_refresh():
     return {"status": "refresh complete"}
 
 
-@app.post("/admin/settle", tags=["admin"])
+@admin.post("/settle")
 def manual_settle():
     """Immediately settle all open BetLog rows against finished match results."""
     from scheduler import _resolve_predictions
@@ -298,7 +321,7 @@ def manual_settle():
     return {"status": "settlement complete"}
 
 
-@app.post("/admin/recalibrate-elo", tags=["admin"])
+@admin.post("/recalibrate-elo")
 def recalibrate_elo(competition: str = "WC"):
     """
     Re-derive team ELO ratings from actual tournament results (K=40).
@@ -356,7 +379,7 @@ def recalibrate_elo(competition: str = "WC"):
     return {"status": "ok", "competition": competition, "teams_updated": updated}
 
 
-@app.post("/admin/clear-pending-bets", tags=["admin"])
+@admin.post("/clear-pending-bets")
 def clear_pending_bets(competition: str | None = None):
     """
     Delete pending (unsettled) BetLog rows. Backs up the DB first.
@@ -375,7 +398,7 @@ def clear_pending_bets(competition: str | None = None):
     return {"deleted": n, "competition": competition or "all", "backup": backup_path}
 
 
-@app.post("/admin/retrain", tags=["admin"])
+@admin.post("/retrain")
 def manual_retrain():
     """Kick off a background model retrain (runs train_models.py in a subprocess)."""
     from scheduler import _retrain_models
@@ -383,7 +406,7 @@ def manual_retrain():
     return {"status": "retrain started — check logs for progress"}
 
 
-@app.get("/admin/retrain/status", tags=["admin"])
+@admin.get("/retrain/status")
 def retrain_status():
     """Quick health-check: is a retrain currently running?"""
     import subprocess
@@ -394,7 +417,7 @@ def retrain_status():
     return {"running": running}
 
 
-@app.get("/admin/model-drift", tags=["admin"])
+@admin.get("/model-drift")
 def model_drift():
     """
     Compare rolling 30-day accuracy to the historical baseline.
@@ -444,7 +467,7 @@ def model_drift():
     }
 
 
-@app.get("/admin/feature-importance", tags=["admin"])
+@admin.get("/feature-importance")
 def feature_importance():
     """Returns XGBoost gain-based feature importances from the loaded outcome model."""
     from prediction.predictor import get_predictor
@@ -455,7 +478,7 @@ def feature_importance():
     return {"features": imps, "n_features": len(imps)}
 
 
-@app.get("/admin/model-info", tags=["admin"])
+@admin.get("/model-info")
 def model_info():
     """
     Returns model version, training metadata, Brier score, and feature list.
@@ -508,3 +531,6 @@ def model_info():
         "brier_baseline":  0.6667,
         "brier_skill":     round(1 - brier / 0.6667, 4) if brier else None,
     }
+
+
+app.include_router(admin)
